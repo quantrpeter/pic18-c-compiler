@@ -51,12 +51,14 @@ PROG    CODE
 ; locals for main()
 LOC_main  UDATA_ACS
 F_main__LOC_i           RES     1
+F_main__LOC_b           RES     1
 F_main__LOC_a           RES     1
 PROG    CODE
 
 ; ===== function main() =====
 MAIN:
         CLRF    F_main__LOC_i, A
+        CLRF    F_main__LOC_b, A
         CLRF    F_main__LOC_a, A
         ; expression-statement
         ; out(1 /* LATB */, expr)
@@ -87,6 +89,9 @@ WHILE_0:
         CALL    F_delay, 0
         BRA     WHILE_0
 WEND_1:
+        ; init local b
+        MOVLW   0x00
+        MOVWF   F_main__LOC_b, A
         ; for (...)
         MOVLW   0x00
         MOVWF   F_main__LOC_a, A
@@ -94,6 +99,15 @@ FOR_2:
         MOVF    F_main__LOC_a, W, A
         MOVWF   EVAL_STACK+0, A   ; push (sp=0)
         MOVLW   0x0A
+        MOVWF   EVAL_STACK+1, A   ; push (sp=1)
+        MOVF    F_main__LOC_b, W, A
+        MOVWF   EVAL_STACK+2, A   ; push (sp=2)
+        MOVF    EVAL_STACK+2, W, A      ; reload lhs
+        MOVWF   R0, A
+        BCF     STATUS, C, A   ; clear carry
+        RRCF    R0, F, A
+        MOVF    R0, W, A         ; W = lhs / 2
+        ADDWF   EVAL_STACK+1, W, A   ; W = lhs + rhs
         CPFSGT  EVAL_STACK+0, A   ; skip next if < true
         BRA     CMP_F_4
         MOVLW   0x01
@@ -121,6 +135,10 @@ CMP_E_5:
         MOVLW   0xC8
         MOVWF   ARG0, A
         CALL    F_delay, 0
+        ; expression-statement
+        ; post-inc b
+        MOVF    F_main__LOC_b, W, A      ; W = old b
+        INCF    F_main__LOC_b, F, A      ; b++ (W keeps old value)
         ; post-inc a
         MOVF    F_main__LOC_a, W, A      ; W = old a
         INCF    F_main__LOC_a, F, A      ; a++ (W keeps old value)
@@ -130,7 +148,7 @@ FEND_3:
         MOVWF   RETVAL, A
         RETURN
         RETURN
-        ; max expr-stack depth used here: 1
+        ; max expr-stack depth used here: 3
 
 ; ===== runtime: delay(n) — nested decrement loop ======
 F_delay:

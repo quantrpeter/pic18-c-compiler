@@ -2,8 +2,8 @@ package com.example.pic18;
 
 import com.example.pic18.codegen.CompileException;
 import com.example.pic18.codegen.Pic18CodeGenerator;
-import com.example.pic18.grammar.MiniCLexer;
-import com.example.pic18.grammar.MiniCParser;
+import com.example.pic18.grammar.CLexer;
+import com.example.pic18.grammar.CParser;
 import org.antlr.v4.runtime.BaseErrorListener;
 import org.antlr.v4.runtime.CharStream;
 import org.antlr.v4.runtime.CharStreams;
@@ -125,9 +125,9 @@ public final class Main {
      */
     public static String compileSource(String source, String sourceName, PrintStream err) {
         CharStream cs = CharStreams.fromString(source, sourceName == null ? "<string>" : sourceName);
-        MiniCLexer lexer = new MiniCLexer(cs);
+        CLexer lexer = new CLexer(cs);
         CommonTokenStream tokens = new CommonTokenStream(lexer);
-        MiniCParser parser = new MiniCParser(tokens);
+        CParser parser = new CParser(tokens);
 
         DiagnosticErrorListener listener = new DiagnosticErrorListener(err);
         lexer.removeErrorListeners();
@@ -135,7 +135,7 @@ public final class Main {
         parser.removeErrorListeners();
         parser.addErrorListener(listener);
 
-        MiniCParser.ProgramContext tree = parser.program();
+        CParser.CompilationUnitContext tree = parser.compilationUnit();
 
         if (listener.errorCount() > 0) {
             throw new SyntaxErrorException(listener.errorCount() + " syntax error(s)");

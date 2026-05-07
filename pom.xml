@@ -68,7 +68,15 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.13.0</version>
+                <!--
+                  3.14.0+ is required when building on JDK 25 or newer.
+                  Older versions (e.g. 3.13.0) silently produce broken
+                  bytecode for some classes — most visibly, the generated
+                  CLexer ends up without its `extends CLexerBase` superclass,
+                  which then throws "Unresolved compilation problems" at
+                  runtime even though `mvn compile` reports BUILD SUCCESS.
+                -->
+                <version>3.14.0</version>
                 <configuration>
                     <release>17</release>
                 </configuration>

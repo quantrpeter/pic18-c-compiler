@@ -7,7 +7,15 @@ hand-written code generator that emits MPASM-style PIC18 assembly.
 This is **not** a production compiler. The point is to be small, readable,
 and easy to extend in a classroom setting.
 
+The parser uses the upstream **C11 grammar** from [`antlr/grammars-v4`][gv4]
+(`CLexer.g4` + `CParser.g4`), so you can write C source the way C source
+actually looks. The codegen, however, only handles the small subset
+described in [Supported C subset](#supported-c-subset) below — anything else
+the grammar accepts will parse fine but be rejected with a clear
+"…not supported in this teaching compiler" error from the codegen.
+
 [antlr]: https://www.antlr.org/
+[gv4]: https://github.com/antlr/grammars-v4/tree/master/c
 
 ---
 
@@ -23,9 +31,14 @@ pic18-c-compiler/
 │   └── blink.asm           # produced by the compiler (committed for review)
 ├── src/
 │   ├── main/
-│   │   ├── antlr4/com/example/pic18/grammar/MiniC.g4
+│   │   ├── antlr4/com/example/pic18/grammar/
+│   │   │   ├── CLexer.g4                       # vendored from antlr/grammars-v4
+│   │   │   └── CParser.g4                      # vendored from antlr/grammars-v4
 │   │   └── java/com/example/pic18/
 │   │       ├── Main.java                       # CLI driver
+│   │       ├── grammar/
+│   │       │   ├── CLexerBase.java             # minimal stub (no preprocessor)
+│   │       │   └── CParserBase.java            # minimal stub (no symbol table)
 │   │       └── codegen/
 │   │           ├── CompileException.java
 │   │           └── Pic18CodeGenerator.java     # the actual codegen
@@ -58,6 +71,47 @@ mvn -DskipTests exec:java \
 # Write the assembly to stdout instead of a file:
 java -jar target/pic18-c-compiler-0.1.0-SNAPSHOT.jar examples/blink.c -o -
 ```
+
+---
+
+## Grammar
+
+`CLexer.g4` and `CParser.g4` under `src/main/antlr4/com/example/pic18/grammar/`
+are the **unmodified C11 grammars** from
+[antlr/grammars-v4](https://github.com/antlr/grammars-v4/tree/master/c).
+
+Both grammars declare a `superClass` (`CLexerBase` / `CParserBase`) for
+runtime helpers — semantic predicates that disambiguate things like
+typedef-names from identifiers, and action methods that maintain a parse-time
+symbol table. The upstream Java implementations of those base classes are
+big enough to dwarf the rest of this project — `CLexerBase` shells out to a
+system `gcc`/`clang` to preprocess the input, and `CParserBase` carries a
+~600-line C symbol table. Both are wildly out of scope for a teaching
+compiler that doesn't even support `typedef` or `#include`.
+
+We therefore ship **minimal stub** versions of those base classes under
+`src/main/java/com/example/pic18/grammar/`:
+
+* `CLexerBase` is a no-op pass-through. The grammar's existing
+  `MultiLineMacro` / `Directive` / `LineDirective` lexer rules already route
+  any stray `#…` lines to a hidden channel, so the lexer just ignores them
+  rather than running a preprocessor.
+* `CParserBase` implements every semantic predicate
+  (`IsStatement`, `IsDeclaration`, `IsCast`, `IsTypedefName`, …) with a
+  small token-lookahead heuristic, and gives every action method
+  (`OutputSymbolTable`, `EnterScope`, …) an empty body.
+
+Because we don't track typedefs, source like `typedef int T; T x;` will not
+parse the second statement as a declaration. That's fine: the codegen
+rejects `typedef` up front anyway. Everything in the Supported C subset
+below works.
+
+The parser is therefore the *only* layer that "understands C11". Anything
+the grammar accepts but the codegen doesn't (pointers, structs, casts,
+sizeof, switch, do-while, goto, string literals, multiple declarators per
+declaration, compound assignment, etc.) is reported as a clear
+"…not supported in this teaching compiler" error from the codegen rather
+than as a parse error.
 
 ---
 
@@ -174,11 +228,18 @@ simplified:
   *parameter-less, local-less* functions is fine.
 * **Maximum 4 arguments per function**, all byte-sized. (Increase
   `MAX_ARGS` and add more `ARG*` slots if you need more.)
-* **No `struct`, `typedef`, `enum`, arrays, pointers, or strings.** The
-  language really is just integers and control flow.
+* **No `struct`, `union`, `typedef`, `enum`, arrays, pointers, casts,
+  `sizeof`, or strings.** The language really is just integers and control
+  flow. The C11 grammar parses all of those, but the codegen rejects them
+  with `"<feature> not supported"` errors.
+* **No `switch`, `do/while`, `goto`, `break`, `continue`, labels, ternary
+  `?:`, or compound assignment (`+=`, `-=`, …).** Same story — parsed,
+  rejected by the codegen.
 * **No real preprocessor**: `#include`, `#define`, `#ifdef` are not
-  recognised. The lexer treats anything starting with `#` outside the
-  generated assembly's prelude as a syntax error.
+  expanded. The C11 lexer routes any `#`-prefixed lines to a hidden channel
+  (the stub `CLexerBase` is a pass-through, not a real preprocessor), so
+  they're silently ignored rather than expanded. If you need them, run the
+  source through `cpp` first.
 * **No floating point.**
 * **Division & modulus by a non-power-of-two is a compile error.** Constant
   power-of-two divisors are lowered to repeated `RRCF`/`ANDLW`. A real

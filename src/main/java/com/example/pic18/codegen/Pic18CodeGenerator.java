@@ -1,67 +1,63 @@
 package com.example.pic18.codegen;
 
-import com.example.pic18.grammar.MiniCBaseVisitor;
-import com.example.pic18.grammar.MiniCParser;
+import com.example.pic18.grammar.CParser;
+import com.example.pic18.grammar.CParser.*;
 import org.antlr.v4.runtime.ParserRuleContext;
+import org.antlr.v4.runtime.tree.ParseTree;
 import org.antlr.v4.runtime.tree.TerminalNode;
 
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
 
 /**
  * Generates MPASM-style PIC18 assembly (targeted at the PIC18F4520) from a
- * MiniC parse tree.
+ * C11 parse tree produced by {@link com.example.pic18.grammar.CParser}.
  *
- * <h2>Design overview</h2>
+ * <h2>Supported C subset</h2>
  *
- * The generator is intentionally simple and teaching-oriented; clarity beats
- * efficiency. The code shape is:
+ * Despite consuming the full C11 grammar, this codegen only handles the same
+ * teaching-quality subset the project has always supported:
  *
- * <pre>
- *   LIST P=18F4520
- *   #include &lt;p18f4520.inc&gt;
- *   CONFIG OSC=INTIO67, WDT=OFF, LVP=OFF, MCLRE=OFF, PBADEN=DIG
- *   ; -- variables --------------------------------------------------------
- *   ACS_BANK  UDATA_ACS
- *   R0/R1/.../R7        scratch
- *   ARG0..ARG3          calling-convention argument slots
- *   RETVAL              return value mirror of WREG
- *   DELAY_CNT_*         delay-loop counters
- *   EVAL_STACK[0..15]   expression evaluation stack
- *   G_&lt;name&gt;            globals
- *   F_&lt;fn&gt;__LOC_&lt;v&gt;  per-function locals (statically allocated)
- *   ; -- code -------------------------------------------------------------
- *   reset  CODE  0x0000   GOTO MAIN
- *   hi-isr CODE  0x0008   RETFIE FAST    ; placeholder
- *   prog   CODE
- *           function bodies, then runtime helpers (delay, etc.)
- *   END
- * </pre>
- *
- * <h2>Calling convention (8-bit only)</h2>
  * <ul>
- *   <li>Up to 4 byte-sized arguments passed in fixed RAM slots
- *       {@code ARG0..ARG3}. The caller stores them before {@code CALL}.</li>
- *   <li>Return value left in {@code WREG} and mirrored to {@code RETVAL}.</li>
- *   <li>Calls use the PIC18 hardware return stack (limit: 31 nested
- *       {@code CALL}s).</li>
- *   <li>Locals are <em>not</em> stored on a stack – they get statically
- *       allocated bytes per function. Two activations of the same function
- *       (recursion) therefore alias each other's locals.</li>
+ *   <li>Primitive integer types: {@code int}, {@code char}, optionally with
+ *       {@code unsigned}/{@code signed}. All are 8-bit on this target.</li>
+ *   <li>{@code void} return type / parameter list.</li>
+ *   <li>Global variable declarations with optional constant initializers.</li>
+ *   <li>Function definitions and prototypes (up to {@value #MAX_ARGS} byte
+ *       parameters).</li>
+ *   <li>{@code if}/{@code else}, {@code while}, {@code for}, {@code return},
+ *       expression statements, single-identifier assignment.</li>
+ *   <li>Arithmetic ({@code + - *}), constant power-of-two {@code /} and
+ *       {@code %}, bitwise ({@code & | ^ ~}), constant-count shifts
+ *       ({@code << >>}), comparisons, short-circuit logicals, unary
+ *       {@code + - ! ~}, pre/post {@code ++}/{@code --} on bare
+ *       identifiers.</li>
+ *   <li>Built-ins {@code out(port, value)}, {@code in(port)},
+ *       {@code delay(n)}.</li>
  * </ul>
  *
- * <h2>Expression evaluation</h2>
+ * Anything else the grammar accepts (pointers, arrays, structs, unions,
+ * enums, typedefs, switch, do-while, goto, labels, casts, sizeof, string
+ * literals, floating constants, multiple declarators per declaration, etc.)
+ * is rejected with a {@link CompileException} explaining the limitation.
  *
- * Expressions evaluate to a single byte left in {@code WREG}. For binary
- * operators we compile the left operand to {@code WREG}, push it to the
- * compile-time-tracked stack {@code EVAL_STACK[sp]}, then compile the right
- * operand to {@code WREG}, and finally emit the actual ALU operation against
- * {@code EVAL_STACK[sp-1]}.
+ * <h2>Calling convention &amp; expression evaluation</h2>
+ *
+ * Identical to the previous (MiniC-based) version of this class — see the
+ * project README for the full description. Briefly: every value is one
+ * byte, parameters live in {@code ARG0..ARG3}, the return value is in
+ * {@code WREG} mirrored to {@code RETVAL}, and binary operators evaluate
+ * the LHS into {@code WREG}, push it to the compile-time-tracked
+ * {@code EVAL_STACK[sp]}, evaluate the RHS into {@code WREG}, then perform
+ * the ALU op against {@code EVAL_STACK[sp-1]}.
  */
-public class Pic18CodeGenerator extends MiniCBaseVisitor<Void> {
+public class Pic18CodeGenerator {
 
     /** Maximum addressable depth of the expression evaluation stack. */
     private static final int EVAL_STACK_SIZE = 16;
@@ -89,16 +85,16 @@ public class Pic18CodeGenerator extends MiniCBaseVisitor<Void> {
     // Public API
     // -------------------------------------------------------------------------
 
-    /** Compile a parsed program and return the assembly source text. */
-    public String compile(MiniCParser.ProgramContext tree) {
-        // Pass 1: collect global declarations and function signatures so we can
-        // do forward references and validate calls.
-        for (MiniCParser.TopLevelContext t : tree.topLevel()) {
-            if (t.globalVarDecl() != null) {
-                registerGlobal(t.globalVarDecl());
-            } else if (t.functionDecl() != null) {
-                registerFunction(t.functionDecl());
-            }
+    /** Compile a parsed translation unit and return the assembly source text. */
+    public String compile(CompilationUnitContext tree) {
+        TranslationUnitContext tu = tree.translationUnit();
+        if (tu == null) {
+            throw new CompileException("empty translation unit (no declarations or function definitions)");
+        }
+
+        // Pass 1: collect global declarations and function signatures.
+        for (ExternalDeclarationContext ext : tu.externalDeclaration()) {
+            registerExternalDecl(ext);
         }
 
         if (!functions.containsKey("main")) {
@@ -110,10 +106,10 @@ public class Pic18CodeGenerator extends MiniCBaseVisitor<Void> {
         emitCodeStart();
 
         // Pass 2: emit code for each function body. Prototype-only declarations
-        // (no '{' block) are skipped.
-        for (MiniCParser.TopLevelContext t : tree.topLevel()) {
-            if (t.functionDecl() != null && t.functionDecl().block() != null) {
-                emitFunction(t.functionDecl());
+        // are skipped because they have no body to emit.
+        for (ExternalDeclarationContext ext : tu.externalDeclaration()) {
+            if (ext.functionDefinition() != null) {
+                emitFunction(ext.functionDefinition());
             }
         }
 
@@ -153,60 +149,318 @@ public class Pic18CodeGenerator extends MiniCBaseVisitor<Void> {
         }
     }
 
-    private void registerGlobal(MiniCParser.GlobalVarDeclContext ctx) {
-        String name = ctx.ID().getText();
-        if (globals.containsKey(name)) {
-            throw new CompileException(ctx, "duplicate global variable '" + name + "'");
-        }
-        Integer initVal = null;
-        if (ctx.expression() != null) {
-            initVal = evalConstantExpression(ctx.expression());
-            if (initVal == null) {
-                throw new CompileException(ctx,
-                        "global initializer must be a constant integer expression");
-            }
-        }
-        globals.put(name, new GlobalSym(name, "G_" + name, initVal));
+    /** Bag of facts extracted from a {@code declarator} parse subtree. */
+    private static final class DeclaratorInfo {
+        String name;
+        boolean isFunction;
+        List<String> paramNames;   // null if not a function
     }
 
-    private void registerFunction(MiniCParser.FunctionDeclContext ctx) {
-        String name = ctx.ID().getText();
-        boolean returnsValue = !"void".equals(typeName(ctx.type()));
-        boolean isPrototype = ctx.block() == null;
+    // -------------------------------------------------------------------------
+    // External declaration registration (pass 1)
+    // -------------------------------------------------------------------------
 
-        java.util.List<String> params = new java.util.ArrayList<>();
-        if (ctx.paramList() != null && ctx.paramList().param() != null) {
-            for (MiniCParser.ParamContext p : ctx.paramList().param()) {
-                params.add(p.ID().getText());
-            }
+    private void registerExternalDecl(ExternalDeclarationContext ext) {
+        if (ext.functionDefinition() != null) {
+            registerFunctionDef(ext.functionDefinition());
+            return;
         }
-        if (params.size() > MAX_ARGS) {
-            throw new CompileException(ctx,
-                    "function '" + name + "' has " + params.size() + " parameters; max is " + MAX_ARGS);
+        if (ext.declaration() != null) {
+            registerTopLevelDeclaration(ext.declaration());
+            return;
         }
+        if (ext.asmDefinition() != null) {
+            throw new CompileException(ext, "top-level inline asm not supported");
+        }
+        // stray ';' -> nothing to do
+    }
 
-        FunctionSig existing = functions.get(name);
+    private void registerFunctionDef(FunctionDefinitionContext fd) {
+        if (fd.declarationList() != null) {
+            throw new CompileException(fd, "K&R-style declaration lists not supported");
+        }
+        String returnType = typeFromSpecs(fd.declarationSpecifiers(), fd);
+        DeclaratorInfo di = parseDeclarator(fd.declarator());
+        if (!di.isFunction) {
+            throw new CompileException(fd, "function definition has non-function declarator");
+        }
+        boolean returnsValue = !"void".equals(returnType);
+
+        FunctionSig existing = functions.get(di.name);
         if (existing != null) {
-            // Allow prototype-then-definition; allow re-prototyping. Reject
-            // double definitions and signature mismatches.
-            if (existing.paramNames.size() != params.size()
+            if (existing.paramNames.size() != di.paramNames.size()
                     || existing.returnsValue != returnsValue) {
-                throw new CompileException(ctx,
-                        "redeclaration of '" + name + "' with different signature");
+                throw new CompileException(fd,
+                        "redeclaration of '" + di.name + "' with different signature");
             }
-            if (!isPrototype && existing.hasBody) {
-                throw new CompileException(ctx, "duplicate definition of function '" + name + "'");
+            if (existing.hasBody) {
+                throw new CompileException(fd, "duplicate definition of function '" + di.name + "'");
             }
-            if (!isPrototype) {
-                existing.hasBody = true;
+            existing.hasBody = true;
+            return;
+        }
+        String label = di.name.equals("main") ? "MAIN" : ("F_" + di.name);
+        FunctionSig sig = new FunctionSig(di.name, label, di.paramNames, returnsValue);
+        sig.hasBody = true;
+        functions.put(di.name, sig);
+    }
+
+    private void registerTopLevelDeclaration(DeclarationContext dctx) {
+        if (dctx.staticAssertDeclaration() != null) {
+            throw new CompileException(dctx, "_Static_assert declarations not supported");
+        }
+        if (dctx.attributeDeclaration() != null) {
+            throw new CompileException(dctx, "attribute-only declarations not supported");
+        }
+        DeclarationSpecifiersContext ds = dctx.declarationSpecifiers();
+        String type = typeFromSpecs(ds, dctx);
+
+        InitDeclaratorListContext idl = dctx.initDeclaratorList();
+        if (idl == null) {
+            // Bare specifier-only declaration like `int;` -- meaningless; reject.
+            throw new CompileException(dctx, "declaration without declarator not supported");
+        }
+        List<InitDeclaratorContext> ids = idl.initDeclarator();
+        if (ids.size() > 1) {
+            throw new CompileException(dctx,
+                    "multiple declarators in one declaration not supported (write each on its own line)");
+        }
+        InitDeclaratorContext id = ids.get(0);
+        DeclaratorInfo di = parseDeclarator(id.declarator());
+
+        if (di.isFunction) {
+            // Function prototype.
+            if (id.initializer() != null) {
+                throw new CompileException(dctx, "function declaration cannot have initializer");
             }
+            boolean returnsValue = !"void".equals(type);
+            FunctionSig existing = functions.get(di.name);
+            if (existing != null) {
+                if (existing.paramNames.size() != di.paramNames.size()
+                        || existing.returnsValue != returnsValue) {
+                    throw new CompileException(dctx,
+                            "redeclaration of '" + di.name + "' with different signature");
+                }
+                return; // re-prototyping is fine
+            }
+            String label = di.name.equals("main") ? "MAIN" : ("F_" + di.name);
+            FunctionSig sig = new FunctionSig(di.name, label, di.paramNames, returnsValue);
+            sig.hasBody = false;
+            functions.put(di.name, sig);
             return;
         }
 
-        String label = name.equals("main") ? "MAIN" : ("F_" + name);
-        FunctionSig sig = new FunctionSig(name, label, params, returnsValue);
-        sig.hasBody = !isPrototype;
-        functions.put(name, sig);
+        // Global variable declaration.
+        if ("void".equals(type)) {
+            throw new CompileException(dctx, "variable cannot have type 'void'");
+        }
+        if (globals.containsKey(di.name)) {
+            throw new CompileException(dctx, "duplicate global variable '" + di.name + "'");
+        }
+        Integer initVal = null;
+        if (id.initializer() != null) {
+            InitializerContext init = id.initializer();
+            if (init.assignmentExpression() == null) {
+                throw new CompileException(dctx,
+                        "global initializer must be a constant integer (brace initializers not supported)");
+            }
+            initVal = evalConstantAssign(init.assignmentExpression());
+            if (initVal == null) {
+                throw new CompileException(dctx,
+                        "global initializer must be a constant integer expression");
+            }
+        }
+        globals.put(di.name, new GlobalSym(di.name, "G_" + di.name, initVal));
+    }
+
+    // -------------------------------------------------------------------------
+    // Declaration-specifier / declarator parsing
+    // -------------------------------------------------------------------------
+
+    /**
+     * Reduce a {@code declarationSpecifiers} subtree to one of the supported
+     * primitive types: {@code "int"} or {@code "void"}. Throws {@link
+     * CompileException} on anything outside the supported subset (typedef,
+     * static, struct, etc.).
+     */
+    private String typeFromSpecs(DeclarationSpecifiersContext ds, ParserRuleContext ctx) {
+        if (ds == null) {
+            throw new CompileException(ctx, "missing type specifier");
+        }
+        int hasVoid = 0, hasInt = 0, hasChar = 0;
+        int hasShort = 0, hasLong = 0, hasSigned = 0, hasUnsigned = 0;
+
+        for (DeclarationSpecifierContext d : ds.declarationSpecifier()) {
+            if (d.storageClassSpecifier() != null) {
+                String s = d.storageClassSpecifier().getText();
+                throw new CompileException(ctx,
+                        "storage class '" + s + "' not supported in this teaching compiler");
+            }
+            if (d.alignmentSpecifier() != null) {
+                throw new CompileException(ctx, "alignment specifiers not supported");
+            }
+            if (d.typeQualifier() != null) {
+                continue; // const / volatile / restrict / _Atomic -> silently ignore
+            }
+            if (d.functionSpecifier() != null) {
+                continue; // inline / _Noreturn / __stdcall / attributes -> ignore
+            }
+            TypeSpecifierContext ts = d.typeSpecifier();
+            if (ts == null) {
+                continue;
+            }
+            if (ts.structOrUnionSpecifier() != null) {
+                throw new CompileException(ctx, "struct/union types not supported");
+            }
+            if (ts.enumSpecifier() != null) {
+                throw new CompileException(ctx, "enum types not supported");
+            }
+            if (ts.atomicTypeSpecifier() != null) {
+                throw new CompileException(ctx, "_Atomic types not supported");
+            }
+            if (ts.typedefName() != null) {
+                throw new CompileException(ctx,
+                        "typedef-name '" + ts.typedefName().getText() + "' not supported");
+            }
+            if (ts.typeofSpecifier() != null) {
+                throw new CompileException(ctx, "typeof not supported");
+            }
+            // Otherwise it's a single keyword (int, char, void, short, ...) or
+            // a vector / SIMD specifier. The first child is the keyword token.
+            String kw = ts.getChild(0).getText();
+            switch (kw) {
+                case "void"     -> hasVoid++;
+                case "char"     -> hasChar++;
+                case "int"      -> hasInt++;
+                case "short"    -> hasShort++;
+                case "long"     -> hasLong++;
+                case "signed"   -> hasSigned++;
+                case "unsigned" -> hasUnsigned++;
+                case "float", "double" ->
+                        throw new CompileException(ctx, "floating-point types not supported");
+                case "bool", "_Bool" ->
+                        throw new CompileException(ctx, "_Bool/bool not supported");
+                case "_Complex", "_Imaginary" ->
+                        throw new CompileException(ctx, "complex/imaginary types not supported");
+                default ->
+                        throw new CompileException(ctx, "type specifier '" + kw + "' not supported");
+            }
+        }
+
+        if (hasVoid > 0) {
+            if (hasInt + hasChar + hasShort + hasLong + hasSigned + hasUnsigned > 0) {
+                throw new CompileException(ctx, "void cannot be combined with other type specifiers");
+            }
+            return "void";
+        }
+        if (hasShort > 0 || hasLong > 0) {
+            throw new CompileException(ctx,
+                    "short/long types not supported (all integers are 8-bit on PIC18 here)");
+        }
+        if (hasInt + hasChar + hasSigned + hasUnsigned == 0) {
+            throw new CompileException(ctx, "missing or unsupported type specifier");
+        }
+        return "int";
+    }
+
+    /**
+     * Reduce a {@code declarator} subtree to the bare identifier name and a
+     * flag for whether it's a function declarator. Rejects pointers, arrays,
+     * bit-fields, varargs, and unnamed parameters.
+     */
+    private DeclaratorInfo parseDeclarator(DeclaratorContext dctx) {
+        if (!dctx.pointer().isEmpty()) {
+            throw new CompileException(dctx, "pointer types not supported");
+        }
+        return parseDirectDeclarator(dctx.directDeclarator());
+    }
+
+    private DeclaratorInfo parseDirectDeclarator(DirectDeclaratorContext dd) {
+        DeclaratorInfo info = new DeclaratorInfo();
+
+        // Find the base: either an Identifier or '(' declarator ')' wrapping.
+        if (dd.Identifier() != null) {
+            info.name = dd.Identifier().getText();
+        } else if (dd.declarator() != null) {
+            DeclaratorInfo nested = parseDeclarator(dd.declarator());
+            info.name = nested.name;
+            info.isFunction = nested.isFunction;
+            info.paramNames = nested.paramNames;
+        } else {
+            throw new CompileException(dd, "unsupported declarator form");
+        }
+
+        // Reject array suffixes (`[ ... ]`).
+        for (int i = 0; i < dd.getChildCount(); i++) {
+            ParseTree c = dd.getChild(i);
+            if (c instanceof TerminalNode tn && "[".equals(tn.getText())) {
+                throw new CompileException(dd, "array types not supported");
+            }
+            if (c instanceof TerminalNode tn && ":".equals(tn.getText())) {
+                throw new CompileException(dd, "bit-field declarators not supported");
+            }
+        }
+
+        // Detect function suffix `( parameterTypeList )`.
+        if (!dd.parameterTypeList().isEmpty()) {
+            if (info.isFunction) {
+                throw new CompileException(dd, "function-returning-function not supported");
+            }
+            info.isFunction = true;
+            info.paramNames = parseParamList(dd.parameterTypeList(0));
+        }
+        return info;
+    }
+
+    private List<String> parseParamList(ParameterTypeListContext ptl) {
+        List<String> params = new ArrayList<>();
+        // Reject varargs.
+        for (int i = 0; i < ptl.getChildCount(); i++) {
+            ParseTree c = ptl.getChild(i);
+            if (c instanceof TerminalNode tn && "...".equals(tn.getText())) {
+                throw new CompileException(ptl, "varargs not supported");
+            }
+        }
+        if (ptl.parameterList() == null) {
+            return params;
+        }
+        List<ParameterDeclarationContext> pdecls = ptl.parameterList().parameterDeclaration();
+
+        // Special case: `(void)` -> empty parameter list.
+        if (pdecls.size() == 1) {
+            ParameterDeclarationContext only = pdecls.get(0);
+            if (only.declarationSpecifiers() != null
+                    && only.declarator() == null
+                    && only.abstractDeclarator() == null) {
+                String t = typeFromSpecs(only.declarationSpecifiers(), only);
+                if ("void".equals(t)) {
+                    return params;
+                }
+            }
+        }
+
+        for (ParameterDeclarationContext pd : pdecls) {
+            if (pd.declarationSpecifiers() == null) {
+                throw new CompileException(pd, "parameter missing type specifier");
+            }
+            String t = typeFromSpecs(pd.declarationSpecifiers(), pd);
+            if ("void".equals(t)) {
+                throw new CompileException(pd, "parameter cannot have type 'void'");
+            }
+            if (pd.declarator() == null) {
+                throw new CompileException(pd, "unnamed parameters not supported");
+            }
+            DeclaratorInfo di = parseDeclarator(pd.declarator());
+            if (di.isFunction) {
+                throw new CompileException(pd, "function-typed parameters not supported");
+            }
+            params.add(di.name);
+        }
+        if (params.size() > MAX_ARGS) {
+            throw new CompileException(ptl,
+                    "function has " + params.size() + " parameters; max is " + MAX_ARGS);
+        }
+        return params;
     }
 
     // -------------------------------------------------------------------------
@@ -235,30 +489,21 @@ public class Pic18CodeGenerator extends MiniCBaseVisitor<Void> {
     private void emitDataSections() {
         emitLine("; --- Variables (access bank) -------------------------------");
         emitLine("ACS_VARS UDATA_ACS");
-        // Virtual scratch registers.
         for (int i = 0; i < 8; i++) {
             emitLine(pad("R" + i) + "RES     1");
         }
-        // Calling-convention slots.
         for (int i = 0; i < MAX_ARGS; i++) {
             emitLine(pad("ARG" + i) + "RES     1");
         }
         emitLine(pad("RETVAL") + "RES     1");
-        // Delay loop counters (used by the delay() runtime helper).
         emitLine(pad("DELAY_OUTER") + "RES     1");
         emitLine(pad("DELAY_INNER") + "RES     1");
-        // Expression evaluation stack.
         emitLine(pad("EVAL_STACK") + "RES     " + EVAL_STACK_SIZE);
 
-        // Globals.
         for (GlobalSym g : globals.values()) {
             emitLine(pad(g.label) + "RES     1");
         }
 
-        // Per-function parameter mirror slots. (Declared locals are reserved in
-        // a per-function UDATA_ACS section emitted just before the function
-        // body in emitFunction().) Prototype-only declarations don't need
-        // slots because they have no body to reference them.
         for (FunctionSig fn : functions.values()) {
             if (!fn.hasBody) continue;
             for (String p : fn.paramNames) {
@@ -292,30 +537,27 @@ public class Pic18CodeGenerator extends MiniCBaseVisitor<Void> {
     }
 
     // -------------------------------------------------------------------------
-    // Function emission
+    // Function emission (pass 2)
     // -------------------------------------------------------------------------
 
-    private void emitFunction(MiniCParser.FunctionDeclContext ctx) {
-        currentFn = functions.get(ctx.ID().getText());
+    private void emitFunction(FunctionDefinitionContext fd) {
+        DeclaratorInfo di = parseDeclarator(fd.declarator());
+        currentFn = functions.get(di.name);
         currentLocals = new LinkedHashMap<>();
         declaredLocals = new LinkedHashSet<>();
         sp = 0;
         maxSp = 0;
 
-        // Mirror parameters into local slots so they're addressable as variables.
         for (String p : currentFn.paramNames) {
             currentLocals.put(p, localLabel(currentFn.name, p));
             declaredLocals.add(p);
         }
 
-        // Pre-scan for local variable declarations and reserve them in the
-        // udata section *now* (we patch the code buffer because the udata block
-        // was already emitted). We use a deferred mechanism: append RES lines
-        // to a side buffer that we later inject. To keep things linear, we
-        // emit a fresh per-function UDATA section right before the function
-        // label - that's still legal MPASM.
+        // Pre-collect all local variables declared anywhere in the body so we
+        // can reserve their RAM up front. We use a per-function UDATA_ACS
+        // section emitted just before the function label.
         Map<String, String> localsToReserve = new LinkedHashMap<>();
-        collectLocalDecls(ctx.block(), localsToReserve);
+        collectLocalDecls(fd.functionBody().compoundStatement(), localsToReserve);
 
         if (!localsToReserve.isEmpty()) {
             emitLine("");
@@ -346,44 +588,49 @@ public class Pic18CodeGenerator extends MiniCBaseVisitor<Void> {
             emitLine("        MOVWF   " + label + ", A");
         }
 
-        // Initialize all "declared" locals to 0 if they have an initializer
-        // expression (handled when we visit the localDeclStmt). Plain decls
-        // without init are left undefined per C semantics — to be friendlier,
-        // we explicitly clear them.
+        // Friendlier-than-C semantics: zero out declared locals.
         for (Map.Entry<String, String> e : localsToReserve.entrySet()) {
             emitLine("        CLRF    " + e.getValue() + ", A");
         }
 
-        // Body.
-        visit(ctx.block());
+        emitCompound(fd.functionBody().compoundStatement());
 
         // Fall-through return.
         emitLine("        RETURN");
         emitLine("        ; max expr-stack depth used here: " + maxSp);
     }
 
-    /** Walk a function body and gather local-variable declarations. */
+    /** Walk a compound statement and gather every local-variable declaration. */
     private void collectLocalDecls(ParserRuleContext root, Map<String, String> out) {
         if (root == null) {
             return;
         }
-        if (root instanceof MiniCParser.LocalDeclStmtContext lds) {
-            String name = lds.ID().getText();
-            String label = localLabel(currentFn.name, name);
-            if (out.containsKey(name)) {
-                throw new CompileException(lds, "duplicate local '" + name + "' in function '"
-                        + currentFn.name + "'");
+        if (root instanceof DeclarationContext dc) {
+            if (dc.initDeclaratorList() != null) {
+                if (dc.initDeclaratorList().initDeclarator().size() > 1) {
+                    throw new CompileException(dc,
+                            "multiple declarators in one declaration not supported");
+                }
+                InitDeclaratorContext id = dc.initDeclaratorList().initDeclarator(0);
+                DeclaratorInfo di = parseDeclarator(id.declarator());
+                if (di.isFunction) {
+                    throw new CompileException(dc, "nested function declarations not supported");
+                }
+                if (out.containsKey(di.name)) {
+                    throw new CompileException(dc,
+                            "duplicate local '" + di.name + "' in function '" + currentFn.name + "'");
+                }
+                out.put(di.name, localLabel(currentFn.name, di.name));
             }
-            out.put(name, label);
         }
-        if (root instanceof MiniCParser.ForStmtContext fs && fs.forInit() != null
-                && fs.forInit().type() != null) {
-            // for (int i = ...; ...; ...)
-            MiniCParser.ForInitContext fi = fs.forInit();
-            String name = fi.ID().getText();
-            String label = localLabel(currentFn.name, name);
-            if (!out.containsKey(name)) {
-                out.put(name, label);
+        if (root instanceof ForDeclarationContext fdc) {
+            if (fdc.initDeclaratorList() != null) {
+                for (InitDeclaratorContext id : fdc.initDeclaratorList().initDeclarator()) {
+                    DeclaratorInfo di = parseDeclarator(id.declarator());
+                    if (!out.containsKey(di.name)) {
+                        out.put(di.name, localLabel(currentFn.name, di.name));
+                    }
+                }
             }
         }
         for (int i = 0; i < root.getChildCount(); i++) {
@@ -397,204 +644,603 @@ public class Pic18CodeGenerator extends MiniCBaseVisitor<Void> {
     // Statements
     // -------------------------------------------------------------------------
 
-    @Override
-    public Void visitBlock(MiniCParser.BlockContext ctx) {
-        for (MiniCParser.StatementContext s : ctx.statement()) {
-            visit(s);
+    private void emitCompound(CompoundStatementContext cs) {
+        BlockItemListContext bil = cs.blockItemList();
+        if (bil == null) {
+            return;
         }
-        return null;
+        for (BlockItemContext bi : bil.blockItem()) {
+            if (bi.statement() != null) {
+                emitStatement(bi.statement());
+            } else if (bi.declaration() != null) {
+                emitLocalDeclaration(bi.declaration());
+            }
+        }
     }
 
-    @Override
-    public Void visitBlockStmt(MiniCParser.BlockStmtContext ctx) {
-        return visitBlock(ctx.block());
+    private void emitStatement(StatementContext s) {
+        if (s.compoundStatement() != null) {
+            emitCompound(s.compoundStatement());
+        } else if (s.expressionStatement() != null) {
+            emitExpressionStatement(s.expressionStatement());
+        } else if (s.selectionStatement() != null) {
+            emitSelection(s.selectionStatement());
+        } else if (s.iterationStatement() != null) {
+            emitIteration(s.iterationStatement());
+        } else if (s.jumpStatement() != null) {
+            emitJump(s.jumpStatement());
+        } else if (s.labeledStatement() != null) {
+            throw new CompileException(s, "labels (case/default/goto-target) not supported");
+        } else if (s.asmStatement() != null) {
+            throw new CompileException(s, "inline asm statements not supported");
+        }
     }
 
-    @Override
-    public Void visitEmptyStmt(MiniCParser.EmptyStmtContext ctx) {
-        return null;
-    }
-
-    @Override
-    public Void visitLocalDeclStmt(MiniCParser.LocalDeclStmtContext ctx) {
-        String name = ctx.ID().getText();
-        String label = currentLocals.get(name);
+    private void emitLocalDeclaration(DeclarationContext dc) {
+        if (dc.staticAssertDeclaration() != null) {
+            throw new CompileException(dc, "_Static_assert not supported");
+        }
+        if (dc.attributeDeclaration() != null) {
+            throw new CompileException(dc, "attribute-only declarations not supported");
+        }
+        DeclarationSpecifiersContext ds = dc.declarationSpecifiers();
+        String t = typeFromSpecs(ds, dc);
+        if ("void".equals(t)) {
+            throw new CompileException(dc, "void variable not allowed");
+        }
+        InitDeclaratorListContext idl = dc.initDeclaratorList();
+        if (idl == null) {
+            return;
+        }
+        InitDeclaratorContext id = idl.initDeclarator(0);
+        DeclaratorInfo di = parseDeclarator(id.declarator());
+        if (di.isFunction) {
+            throw new CompileException(dc, "nested function declarations not supported");
+        }
+        String label = currentLocals.get(di.name);
         if (label == null) {
-            // Should not happen because we pre-collected; defensive.
-            throw new CompileException(ctx, "internal: local '" + name + "' not pre-allocated");
+            throw new CompileException(dc,
+                    "internal: local '" + di.name + "' not pre-allocated");
         }
-        if (ctx.expression() != null) {
-            emitComment("init local " + name);
-            emitExpression(ctx.expression());
+        if (id.initializer() != null) {
+            InitializerContext init = id.initializer();
+            if (init.assignmentExpression() == null) {
+                throw new CompileException(dc, "brace initializers not supported");
+            }
+            emitComment("init local " + di.name);
+            emitAssignmentExpression(init.assignmentExpression());
             emitLine("        MOVWF   " + label + ", A");
         }
-        return null;
     }
 
-    @Override
-    public Void visitAssignStmt(MiniCParser.AssignStmtContext ctx) {
-        String name = ctx.ID().getText();
-        String label = resolveVariable(name, ctx);
-        emitComment("assign " + name);
-        emitExpression(ctx.expression());
-        emitLine("        MOVWF   " + label + ", A");
-        return null;
-    }
-
-    @Override
-    public Void visitExprStmt(MiniCParser.ExprStmtContext ctx) {
-        emitComment("expression-statement");
-        emitExpression(ctx.expression());
-        return null;
-    }
-
-    @Override
-    public Void visitReturnStmt(MiniCParser.ReturnStmtContext ctx) {
-        if (ctx.expression() != null) {
-            emitExpression(ctx.expression());
-            emitLine("        MOVWF   RETVAL, A");
+    private void emitExpressionStatement(ExpressionStatementContext es) {
+        if (es.expression() == null) {
+            return; // empty `;`
         }
-        emitLine("        RETURN");
-        return null;
+        emitComment("expression-statement");
+        emitExpression(es.expression());
     }
 
-    @Override
-    public Void visitIfStmt(MiniCParser.IfStmtContext ctx) {
+    private void emitSelection(SelectionStatementContext ss) {
+        // First token tells us if/switch.
+        if ("switch".equals(ss.getStart().getText())) {
+            throw new CompileException(ss, "switch statements not supported");
+        }
         String elseLbl = newLabel("ELSE");
         String endLbl = newLabel("ENDIF");
 
         emitComment("if (...)");
-        emitExpression(ctx.expression());
+        emitExpression(ss.expression());
         emitLine("        IORLW   0           ; set Z if W==0");
         emitLine("        BZ      " + elseLbl);
 
-        visit(ctx.statement(0));
+        emitStatement(ss.statement(0));
         emitLine("        BRA     " + endLbl);
 
         emitLine(elseLbl + ":");
-        if (ctx.statement().size() > 1) {
-            visit(ctx.statement(1));
+        if (ss.statement().size() > 1) {
+            emitStatement(ss.statement(1));
         }
         emitLine(endLbl + ":");
-        return null;
     }
 
-    @Override
-    public Void visitWhileStmt(MiniCParser.WhileStmtContext ctx) {
-        String topLbl = newLabel("WHILE");
-        String endLbl = newLabel("WEND");
-
-        emitComment("while (...)");
-        emitLine(topLbl + ":");
-        emitExpression(ctx.expression());
-        emitLine("        IORLW   0");
-        emitLine("        BZ      " + endLbl);
-        visit(ctx.statement());
-        emitLine("        BRA     " + topLbl);
-        emitLine(endLbl + ":");
-        return null;
+    private void emitIteration(IterationStatementContext is) {
+        if (is.Do() != null) {
+            throw new CompileException(is, "do-while not supported");
+        }
+        if (is.For() != null) {
+            emitFor(is);
+            return;
+        }
+        if (is.While() != null) {
+            String topLbl = newLabel("WHILE");
+            String endLbl = newLabel("WEND");
+            emitComment("while (...)");
+            emitLine(topLbl + ":");
+            emitExpression(is.expression());
+            emitLine("        IORLW   0");
+            emitLine("        BZ      " + endLbl);
+            emitStatement(is.statement());
+            emitLine("        BRA     " + topLbl);
+            emitLine(endLbl + ":");
+            return;
+        }
+        throw new CompileException(is, "internal: unknown iteration form");
     }
 
-    @Override
-    public Void visitForStmt(MiniCParser.ForStmtContext ctx) {
+    private void emitFor(IterationStatementContext is) {
         String topLbl = newLabel("FOR");
         String endLbl = newLabel("FEND");
-
         emitComment("for (...)");
-        if (ctx.forInit() != null) {
-            MiniCParser.ForInitContext fi = ctx.forInit();
-            if (fi.type() != null) {
-                String name = fi.ID().getText();
-                String label = currentLocals.get(name);
-                if (label == null) {
-                    throw new CompileException(fi, "internal: for-init local '" + name + "' missing");
+        ForConditionContext fc = is.forCondition();
+
+        // -- Init clause ----------------------------------------------------
+        if (fc.forDeclaration() != null) {
+            ForDeclarationContext fd = fc.forDeclaration();
+            String t = typeFromSpecs(fd.declarationSpecifiers(), fd);
+            if ("void".equals(t)) {
+                throw new CompileException(fd, "void variable in for-init");
+            }
+            if (fd.initDeclaratorList() != null) {
+                for (InitDeclaratorContext id : fd.initDeclaratorList().initDeclarator()) {
+                    DeclaratorInfo di = parseDeclarator(id.declarator());
+                    String label = currentLocals.get(di.name);
+                    if (label == null) {
+                        throw new CompileException(fd,
+                                "internal: for-init local '" + di.name + "' missing");
+                    }
+                    if (id.initializer() != null) {
+                        InitializerContext init = id.initializer();
+                        if (init.assignmentExpression() == null) {
+                            throw new CompileException(fd, "brace initializers not supported");
+                        }
+                        emitAssignmentExpression(init.assignmentExpression());
+                        emitLine("        MOVWF   " + label + ", A");
+                    }
                 }
-                if (fi.expression() != null) {
-                    emitExpression(fi.expression());
-                    emitLine("        MOVWF   " + label + ", A");
+            }
+        } else if (fc.expression() != null) {
+            emitExpression(fc.expression());
+        }
+
+        // -- Determine which forExpression slot is condition vs step --------
+        // The grammar is roughly:  init? ';' cond? ';' step?
+        // ANTLR doesn't tell us which optional was present, so walk children
+        // and remember the index of each forExpression relative to the
+        // surrounding semicolons.
+        int condIdx = -1;
+        int stepIdx = -1;
+        int feSeen = 0;
+        int semis = 0;
+        for (int i = 0; i < fc.getChildCount(); i++) {
+            ParseTree c = fc.getChild(i);
+            if (c instanceof TerminalNode tn && ";".equals(tn.getText())) {
+                semis++;
+            } else if (c instanceof ForExpressionContext) {
+                if (semis == 1) {
+                    condIdx = feSeen;
+                } else if (semis == 2) {
+                    stepIdx = feSeen;
                 }
-            } else if (fi.ID() != null) {
-                String name = fi.ID().getText();
-                String label = resolveVariable(name, fi);
-                emitExpression(fi.expression());
-                emitLine("        MOVWF   " + label + ", A");
-            } else if (fi.expression() != null) {
-                emitExpression(fi.expression());
+                feSeen++;
             }
         }
+
         emitLine(topLbl + ":");
-        if (ctx.expression().size() > 0) {
-            // first expression is the test (if any)
-            emitExpression(ctx.expression(0));
+        List<ForExpressionContext> fexprs = fc.forExpression();
+        if (condIdx >= 0) {
+            emitForExpression(fexprs.get(condIdx));
             emitLine("        IORLW   0");
             emitLine("        BZ      " + endLbl);
         }
-        visit(ctx.statement());
-        if (ctx.expression().size() > 1) {
-            // second expression is the step
-            emitExpression(ctx.expression(1));
+        emitStatement(is.statement());
+        if (stepIdx >= 0) {
+            emitForExpression(fexprs.get(stepIdx));
         }
         emitLine("        BRA     " + topLbl);
         emitLine(endLbl + ":");
-        return null;
+    }
+
+    private void emitJump(JumpStatementContext js) {
+        String first = js.getStart().getText();
+        switch (first) {
+            case "goto"     -> throw new CompileException(js, "goto not supported");
+            case "continue" -> throw new CompileException(js, "continue not supported");
+            case "break"    -> throw new CompileException(js, "break not supported");
+            case "return" -> {
+                if (js.expression() != null) {
+                    emitExpression(js.expression());
+                    emitLine("        MOVWF   RETVAL, A");
+                }
+                emitLine("        RETURN");
+            }
+            default -> throw new CompileException(js, "internal: unknown jump '" + first + "'");
+        }
     }
 
     // -------------------------------------------------------------------------
     // Expressions
     // -------------------------------------------------------------------------
 
-    /**
-     * Compile an expression so that its 8-bit result ends up in {@code WREG}.
-     */
-    private void emitExpression(MiniCParser.ExpressionContext ctx) {
-        if (ctx instanceof MiniCParser.ParenExprContext p) {
-            emitExpression(p.expression());
-        } else if (ctx instanceof MiniCParser.IntLitContext lit) {
-            emitLoadConst(parseInt(lit.INT().getText(), 10), lit);
-        } else if (ctx instanceof MiniCParser.HexLitContext lit) {
-            emitLoadConst(parseInt(lit.HEX().getText().substring(2), 16), lit);
-        } else if (ctx instanceof MiniCParser.CharLitContext lit) {
-            emitLoadConst(parseChar(lit.CHAR().getText(), lit), lit);
-        } else if (ctx instanceof MiniCParser.IdExprContext ie) {
-            emitLoadVar(ie.ID().getText(), ie);
-        } else if (ctx instanceof MiniCParser.PostIncExprContext pe) {
-            emitIncDec(pe.ID(), pe.op.getText(), /*postfix=*/true, pe);
-        } else if (ctx instanceof MiniCParser.PreIncExprContext pe) {
-            emitIncDec(pe.ID(), pe.op.getText(), /*postfix=*/false, pe);
-        } else if (ctx instanceof MiniCParser.UnaryExprContext ue) {
-            emitUnary(ue);
-        } else if (ctx instanceof MiniCParser.MulExprContext me) {
-            emitBinary(me.expression(0), me.expression(1), me.op.getText(), me);
-        } else if (ctx instanceof MiniCParser.AddExprContext ae) {
-            emitBinary(ae.expression(0), ae.expression(1), ae.op.getText(), ae);
-        } else if (ctx instanceof MiniCParser.ShiftExprContext se) {
-            emitShift(se);
-        } else if (ctx instanceof MiniCParser.RelExprContext re) {
-            emitBinary(re.expression(0), re.expression(1), re.op.getText(), re);
-        } else if (ctx instanceof MiniCParser.EqExprContext ee) {
-            emitBinary(ee.expression(0), ee.expression(1), ee.op.getText(), ee);
-        } else if (ctx instanceof MiniCParser.BitAndExprContext be) {
-            emitBinary(be.expression(0), be.expression(1), "&", be);
-        } else if (ctx instanceof MiniCParser.BitXorExprContext be) {
-            emitBinary(be.expression(0), be.expression(1), "^", be);
-        } else if (ctx instanceof MiniCParser.BitOrExprContext be) {
-            emitBinary(be.expression(0), be.expression(1), "|", be);
-        } else if (ctx instanceof MiniCParser.LogAndExprContext la) {
-            emitLogicalAnd(la);
-        } else if (ctx instanceof MiniCParser.LogOrExprContext lo) {
-            emitLogicalOr(lo);
-        } else if (ctx instanceof MiniCParser.CallExprContext ce) {
-            emitCall(ce);
-        } else {
-            throw new CompileException(ctx,
-                    "internal: unhandled expression alternative " + ctx.getClass().getSimpleName());
+    /** Emit each comma-separated assignment-expression in turn; result of last in W. */
+    private void emitExpression(ExpressionContext ctx) {
+        for (AssignmentExpressionContext ae : ctx.assignmentExpression()) {
+            emitAssignmentExpression(ae);
         }
+    }
+
+    private void emitForExpression(ForExpressionContext ctx) {
+        for (AssignmentExpressionContext ae : ctx.assignmentExpression()) {
+            emitAssignmentExpression(ae);
+        }
+    }
+
+    private void emitAssignmentExpression(AssignmentExpressionContext ctx) {
+        if (ctx.DigitSequence() != null) {
+            // The grammar permits a bare DigitSequence here as a `for` corner-case.
+            emitLoadConst(parseInt(ctx.DigitSequence().getText(), 10), ctx);
+            return;
+        }
+        if (ctx.assignementOperator != null) {
+            String op = ctx.assignementOperator.getText();
+            if (!"=".equals(op)) {
+                throw new CompileException(ctx, "compound assignment '" + op + "' not supported");
+            }
+            String name = extractBareIdentifier(ctx.unaryExpression());
+            if (name == null) {
+                throw new CompileException(ctx,
+                        "left side of '=' must be a bare identifier in this teaching compiler");
+            }
+            String label = resolveVariable(name, ctx);
+            emitComment("assign " + name);
+            emitAssignmentExpression(ctx.assignmentExpression());
+            emitLine("        MOVWF   " + label + ", A");
+            return;
+        }
+        emitConditional(ctx.conditionalExpression());
+    }
+
+    private void emitConditional(ConditionalExpressionContext ctx) {
+        if (ctx.expression() != null) {
+            throw new CompileException(ctx, "ternary '?:' not supported");
+        }
+        emitLogicalOr(ctx.logicalOrExpression());
+    }
+
+    private void emitLogicalOr(LogicalOrExpressionContext ctx) {
+        List<LogicalAndExpressionContext> opers = ctx.logicalAndExpression();
+        if (opers.size() == 1) {
+            emitLogicalAnd(opers.get(0));
+            return;
+        }
+        String trueLbl = newLabel("LOR_T");
+        String endLbl = newLabel("LOR_E");
+        for (LogicalAndExpressionContext op : opers) {
+            emitLogicalAnd(op);
+            emitLine("        IORLW   0");
+            emitLine("        BNZ     " + trueLbl);
+        }
+        emitLine("        MOVLW   0x00");
+        emitLine("        BRA     " + endLbl);
+        emitLine(trueLbl + ":");
+        emitLine("        MOVLW   0x01");
+        emitLine(endLbl + ":");
+    }
+
+    private void emitLogicalAnd(LogicalAndExpressionContext ctx) {
+        List<InclusiveOrExpressionContext> opers = ctx.inclusiveOrExpression();
+        if (opers.size() == 1) {
+            emitInclusiveOr(opers.get(0));
+            return;
+        }
+        String falseLbl = newLabel("LAND_F");
+        String endLbl = newLabel("LAND_E");
+        for (InclusiveOrExpressionContext op : opers) {
+            emitInclusiveOr(op);
+            emitLine("        IORLW   0");
+            emitLine("        BZ      " + falseLbl);
+        }
+        emitLine("        MOVLW   0x01");
+        emitLine("        BRA     " + endLbl);
+        emitLine(falseLbl + ":");
+        emitLine("        MOVLW   0x00");
+        emitLine(endLbl + ":");
+    }
+
+    private void emitInclusiveOr(InclusiveOrExpressionContext ctx) {
+        emitChain(ctx.exclusiveOrExpression(), extractOps(ctx, "|"), this::emitExclusiveOr, ctx);
+    }
+
+    private void emitExclusiveOr(ExclusiveOrExpressionContext ctx) {
+        emitChain(ctx.andExpression(), extractOps(ctx, "^"), this::emitAnd, ctx);
+    }
+
+    private void emitAnd(AndExpressionContext ctx) {
+        emitChain(ctx.equalityExpression(), extractOps(ctx, "&"), this::emitEquality, ctx);
+    }
+
+    private void emitEquality(EqualityExpressionContext ctx) {
+        emitChain(ctx.relationalExpression(), extractOps(ctx, "==", "!="), this::emitRelational, ctx);
+    }
+
+    private void emitRelational(RelationalExpressionContext ctx) {
+        emitChain(ctx.shiftExpression(), extractOps(ctx, "<", ">", "<=", ">="), this::emitShift, ctx);
+    }
+
+    private void emitShift(ShiftExpressionContext ctx) {
+        List<AdditiveExpressionContext> opers = ctx.additiveExpression();
+        if (opers.size() == 1) {
+            emitAdditive(opers.get(0));
+            return;
+        }
+        List<String> ops = extractOps(ctx, "<<", ">>");
+        emitAdditive(opers.get(0));
+        for (int i = 1; i < opers.size(); i++) {
+            Integer rhsConst = evalConstantAdditive(opers.get(i));
+            if (rhsConst == null) {
+                throw new CompileException(ctx,
+                        "shift count must be a constant integer (variable shifts not yet supported)");
+            }
+            int n = rhsConst & 0xFF;
+            if (n == 0) {
+                continue;
+            }
+            String op = ops.get(i - 1);
+            emitLine("        MOVWF   R0, A");
+            for (int k = 0; k < n; k++) {
+                emitLine("        BCF     STATUS, C, A");
+                if (op.equals("<<")) {
+                    emitLine("        RLCF    R0, F, A");
+                } else {
+                    emitLine("        RRCF    R0, F, A");
+                }
+            }
+            emitLine("        MOVF    R0, W, A");
+        }
+    }
+
+    private void emitAdditive(AdditiveExpressionContext ctx) {
+        emitChain(ctx.multiplicativeExpression(), extractOps(ctx, "+", "-"),
+                this::emitMultiplicative, ctx);
+    }
+
+    private void emitMultiplicative(MultiplicativeExpressionContext ctx) {
+        List<CastExpressionContext> opers = ctx.castExpression();
+        if (opers.size() == 1) {
+            emitCast(opers.get(0));
+            return;
+        }
+        List<String> ops = extractOps(ctx, "*", "/", "%");
+        emitCast(opers.get(0));
+        for (int i = 1; i < opers.size(); i++) {
+            String op = ops.get(i - 1);
+            pushW();
+            int slot = sp - 1;
+            String lhsRef = "EVAL_STACK+" + slot;
+            if (op.equals("*")) {
+                emitCast(opers.get(i));
+                emitLine("        MULWF   " + lhsRef + ", A      ; PRODH:PRODL = lhs * rhs");
+                emitLine("        MOVF    PRODL, W, A          ; keep low byte");
+            } else {
+                Integer rhsConst = evalConstantCast(opers.get(i));
+                if (rhsConst == null) {
+                    throw new CompileException(ctx,
+                            op + " requires a constant power-of-two right operand "
+                                    + "(division runtime not yet implemented)");
+                }
+                emitConstantDivLowering(rhsConst, lhsRef, op.equals("%"), ctx);
+            }
+            popW();
+        }
+    }
+
+    private void emitConstantDivLowering(int rv, String lhsRef, boolean isMod,
+                                         ParserRuleContext ctx) {
+        rv = rv & 0xFF;
+        if (rv == 0) {
+            throw new CompileException(ctx, "division by zero");
+        }
+        if ((rv & (rv - 1)) != 0) {
+            throw new CompileException(ctx,
+                    (isMod ? "%" : "/") + " by " + rv + " not supported (only powers of two for now)");
+        }
+        int log = Integer.numberOfTrailingZeros(rv);
+        emitLine("        MOVF    " + lhsRef + ", W, A      ; reload lhs");
+        if (isMod) {
+            int mask = rv - 1;
+            emitLine("        ANDLW   " + hex8(mask) + "       ; W = lhs % " + rv);
+        } else {
+            emitLine("        MOVWF   R0, A");
+            for (int k = 0; k < log; k++) {
+                emitLine("        BCF     STATUS, C, A   ; clear carry");
+                emitLine("        RRCF    R0, F, A");
+            }
+            emitLine("        MOVF    R0, W, A         ; W = lhs / " + rv);
+        }
+    }
+
+    private void emitCast(CastExpressionContext ctx) {
+        if (ctx.typeName() != null) {
+            throw new CompileException(ctx, "casts not supported");
+        }
+        if (ctx.DigitSequence() != null) {
+            emitLoadConst(parseInt(ctx.DigitSequence().getText(), 10), ctx);
+            return;
+        }
+        emitUnary(ctx.unaryExpression());
+    }
+
+    private void emitUnary(UnaryExpressionContext ctx) {
+        if (ctx.postfixExpression() != null) {
+            emitPostfix(ctx.postfixExpression());
+            return;
+        }
+        // Pre-increment / pre-decrement.
+        String first = ctx.getStart().getText();
+        if (("++".equals(first) || "--".equals(first)) && ctx.unaryExpression() != null) {
+            String name = extractBareIdentifier(ctx.unaryExpression());
+            if (name == null) {
+                throw new CompileException(ctx,
+                        "pre-" + ("++".equals(first) ? "increment" : "decrement")
+                                + " operand must be a bare identifier");
+            }
+            emitIncDec(name, first, /*postfix=*/false, ctx);
+            return;
+        }
+        // Unary operator: '&', '*', '+', '-', '~', '!', '__extension__', etc.
+        if (ctx.unaryOperator != null && ctx.castExpression() != null) {
+            String op = ctx.unaryOperator.getText();
+            switch (op) {
+                case "+" -> emitCast(ctx.castExpression());
+                case "-" -> {
+                    emitCast(ctx.castExpression());
+                    emitLine("        MOVWF   R0, A         ; unary minus: stash W");
+                    emitLine("        NEGF    R0, A");
+                    emitLine("        MOVF    R0, W, A");
+                }
+                case "!" -> {
+                    emitCast(ctx.castExpression());
+                    String zeroLbl = newLabel("LNOT_Z");
+                    String endLbl = newLabel("LNOT_E");
+                    emitLine("        IORLW   0             ; logical not: set Z if W==0");
+                    emitLine("        BZ      " + zeroLbl);
+                    emitLine("        MOVLW   0x00          ; W was non-zero -> result 0");
+                    emitLine("        BRA     " + endLbl);
+                    emitLine(zeroLbl + ":");
+                    emitLine("        MOVLW   0x01          ; W was zero -> result 1");
+                    emitLine(endLbl + ":");
+                }
+                case "~" -> {
+                    emitCast(ctx.castExpression());
+                    emitLine("        XORLW   0xFF          ; bitwise not");
+                }
+                case "&" -> throw new CompileException(ctx, "address-of '&' not supported");
+                case "*" -> throw new CompileException(ctx, "pointer dereference '*' not supported");
+                default -> throw new CompileException(ctx, "unsupported unary operator '" + op + "'");
+            }
+            return;
+        }
+        // sizeof / Alignof / Countof / && Identifier
+        throw new CompileException(ctx,
+                "sizeof / alignof / countof / address-of-label not supported");
+    }
+
+    private void emitPostfix(PostfixExpressionContext ctx) {
+        PrimaryExpressionContext pe = ctx.primaryExpression();
+        if (pe == null) {
+            throw new CompileException(ctx, "compound literals not supported");
+        }
+        // Collect children after the primary; those are the suffixes.
+        if (ctx.getChildCount() == 1) {
+            emitPrimary(pe);
+            return;
+        }
+        // We support exactly one suffix, and it's either a function call or
+        // a postfix '++' / '--'.
+        ParseTree suffix = ctx.getChild(1);
+
+        if (suffix instanceof TerminalNode tn) {
+            String t = tn.getText();
+            if ("++".equals(t) || "--".equals(t)) {
+                if (ctx.getChildCount() != 2) {
+                    throw new CompileException(ctx, "chained postfix expressions not supported");
+                }
+                String name = extractIdFromPrimary(pe);
+                if (name == null) {
+                    throw new CompileException(ctx,
+                            "post-" + ("++".equals(t) ? "increment" : "decrement")
+                                    + " operand must be a bare identifier");
+                }
+                emitIncDec(name, t, /*postfix=*/true, ctx);
+                return;
+            }
+            if ("(".equals(t)) {
+                // primary '(' argList? ')' (no further suffixes)
+                ArgumentExpressionListContext args = ctx.argumentExpressionList().isEmpty()
+                        ? null : ctx.argumentExpressionList(0);
+                int closingIdx = (args != null) ? 3 : 2;
+                if (ctx.getChildCount() != closingIdx + 1) {
+                    throw new CompileException(ctx,
+                            "chained postfix expressions (e.g. f()()) not supported");
+                }
+                String name = extractIdFromPrimary(pe);
+                if (name == null) {
+                    throw new CompileException(ctx, "indirect function calls not supported");
+                }
+                emitCall(name, args, ctx);
+                return;
+            }
+            if ("[".equals(t)) {
+                throw new CompileException(ctx, "array indexing not supported");
+            }
+            if (".".equals(t) || "->".equals(t)) {
+                throw new CompileException(ctx, "struct/union member access not supported");
+            }
+        }
+        throw new CompileException(ctx, "unsupported postfix expression");
+    }
+
+    private void emitPrimary(PrimaryExpressionContext ctx) {
+        if (ctx.Identifier() != null) {
+            emitLoadVar(ctx.Identifier().getText(), ctx);
+            return;
+        }
+        if (ctx.constant() != null) {
+            emitConstant(ctx.constant());
+            return;
+        }
+        if (ctx.expression() != null) {
+            emitExpression(ctx.expression());
+            return;
+        }
+        if (!ctx.StringLiteral().isEmpty()) {
+            throw new CompileException(ctx, "string literals not supported");
+        }
+        if (ctx.genericSelection() != null) {
+            throw new CompileException(ctx, "_Generic not supported");
+        }
+        String text = ctx.getText();
+        if (text.startsWith("__func__")
+                || text.startsWith("__FUNCTION__")
+                || text.startsWith("__PRETTY_FUNCTION__")) {
+            throw new CompileException(ctx, "function-name predefined identifier not supported");
+        }
+        if (text.startsWith("__builtin_")) {
+            throw new CompileException(ctx, "GCC __builtin_* primitives not supported");
+        }
+        throw new CompileException(ctx, "unsupported primary expression: " + text);
+    }
+
+    private void emitConstant(ConstantContext ctx) {
+        if (ctx.IntegerConstant() != null) {
+            emitLoadConst(parseIntegerLiteral(ctx.IntegerConstant().getText(), ctx), ctx);
+            return;
+        }
+        if (ctx.CharacterConstant() != null) {
+            emitLoadConst(parseCharLiteral(ctx.CharacterConstant().getText(), ctx), ctx);
+            return;
+        }
+        if (ctx.FloatingConstant() != null) {
+            throw new CompileException(ctx, "floating-point constants not supported");
+        }
+        if (ctx.predefinedConstant() != null) {
+            String t = ctx.predefinedConstant().getText();
+            if ("true".equals(t)) {
+                emitLoadConst(1, ctx);
+                return;
+            }
+            if ("false".equals(t)) {
+                emitLoadConst(0, ctx);
+                return;
+            }
+            throw new CompileException(ctx, "predefined constant '" + t + "' not supported");
+        }
+        throw new CompileException(ctx, "unknown constant kind");
     }
 
     private void emitLoadConst(int value, ParserRuleContext ctx) {
         int byteVal = value & 0xFF;
         if ((value & ~0xFF) != 0 && (value & ~0xFF) != ~0xFF) {
-            // Out of byte range — emit a comment but still load the truncated low byte.
             emitComment("warning: literal " + value + " truncated to 8 bits at line "
                     + ctx.getStart().getLine());
         }
@@ -608,150 +1254,86 @@ public class Pic18CodeGenerator extends MiniCBaseVisitor<Void> {
 
     /**
      * Compile a pre-/post-fix {@code ++} or {@code --} on a bare identifier.
-     *
-     * <p>Semantics, for an integer variable {@code v}:
-     * <ul>
-     *   <li>{@code v++} — leave {@code WREG} = old {@code v}, then {@code v++}</li>
-     *   <li>{@code ++v} — {@code v++}, then leave {@code WREG} = new {@code v}</li>
-     *   <li>{@code v--} / {@code --v} — symmetric, with {@code DECF}.</li>
-     * </ul>
-     *
-     * The PIC18 {@code INCF}/{@code DECF} instructions read-modify-write a file
-     * register without touching {@code W} when the destination operand is
-     * {@code F}, which lets us generate compact code for both cases.
+     * See the original codegen comment for the semantic rationale.
      */
-    private void emitIncDec(TerminalNode idNode, String op, boolean postfix,
-                            ParserRuleContext ctx) {
-        String name = idNode.getText();
+    private void emitIncDec(String name, String op, boolean postfix, ParserRuleContext ctx) {
         String label = resolveVariable(name, ctx);
         boolean inc = op.equals("++");
         String mnem = inc ? "INCF" : "DECF";
         String human = (postfix ? "post" : "pre") + (inc ? "-inc " : "-dec ") + name;
         emitComment(human);
         if (postfix) {
-            // W <- old value, then update v in place.
             emitLine("        MOVF    " + label + ", W, A      ; W = old " + name);
             emitLine("        " + mnem + "    " + label + ", F, A      ; " + name
                     + (inc ? "++" : "--") + " (W keeps old value)");
         } else {
-            // Update v in place, then W <- new value.
             emitLine("        " + mnem + "    " + label + ", F, A      ; "
                     + (inc ? "++" : "--") + name);
             emitLine("        MOVF    " + label + ", W, A      ; W = new " + name);
         }
     }
 
-    private void emitUnary(MiniCParser.UnaryExprContext ctx) {
-        String op = ctx.op.getText();
-        emitExpression(ctx.expression());
-        switch (op) {
-            case "-" -> {
-                // PIC18 has no NEGW; stash W in R0, negate R0 in place, reload.
-                emitLine("        MOVWF   R0, A         ; unary minus: stash W");
-                emitLine("        NEGF    R0, A");
-                emitLine("        MOVF    R0, W, A");
-            }
-            case "!" -> {
-                String zeroLbl = newLabel("LNOT_Z");
-                String endLbl  = newLabel("LNOT_E");
-                emitLine("        IORLW   0             ; logical not: set Z if W==0");
-                emitLine("        BZ      " + zeroLbl);
-                emitLine("        MOVLW   0x00          ; W was non-zero -> result 0");
-                emitLine("        BRA     " + endLbl);
-                emitLine(zeroLbl + ":");
-                emitLine("        MOVLW   0x01          ; W was zero -> result 1");
-                emitLine(endLbl + ":");
-            }
-            case "~" -> emitLine("        XORLW   0xFF          ; bitwise not");
-            default  -> throw new CompileException(ctx, "unknown unary op " + op);
+    /** Generic chain compiler for left-associative binary expressions. */
+    private <T extends ParserRuleContext> void emitChain(List<T> opers, List<String> ops,
+                                                         java.util.function.Consumer<T> emit,
+                                                         ParserRuleContext ctx) {
+        if (opers.size() == 1) {
+            emit.accept(opers.get(0));
+            return;
+        }
+        emit.accept(opers.get(0));
+        for (int i = 1; i < opers.size(); i++) {
+            pushW();
+            emit.accept(opers.get(i));
+            emitBinaryOp(ops.get(i - 1), ctx);
+            popW();
         }
     }
 
-    private void emitBinary(MiniCParser.ExpressionContext lhs,
-                            MiniCParser.ExpressionContext rhs,
-                            String op,
-                            ParserRuleContext ctx) {
-        // Compile LHS into W, then push to EVAL_STACK[sp], then compile RHS into W.
-        emitExpression(lhs);
-        pushW();
-        emitExpression(rhs);
-        // Now: WREG = rhs, EVAL_STACK[sp-1] = lhs.
+    /**
+     * Emit assembly for a binary operator with LHS at {@code EVAL_STACK[sp-1]}
+     * and RHS already in {@code WREG}.
+     */
+    private void emitBinaryOp(String op, ParserRuleContext ctx) {
         int slot = sp - 1;
         String lhsRef = "EVAL_STACK+" + slot;
-
         switch (op) {
             case "+" ->
                 emitLine("        ADDWF   " + lhsRef + ", W, A   ; W = lhs + rhs");
-            case "-" -> {
-                // We want lhs - rhs. SUBWF f, W -> W = f - W = lhs - rhs.
+            case "-" ->
                 emitLine("        SUBWF   " + lhsRef + ", W, A   ; W = lhs - rhs");
-            }
-            case "*" -> {
-                // 8-bit unsigned MUL: W * f -> PRODH:PRODL. We keep PRODL.
-                emitLine("        MULWF   " + lhsRef + ", A      ; PRODH:PRODL = lhs * rhs");
-                emitLine("        MOVF    PRODL, W, A          ; keep low byte");
-            }
-            case "/" -> emitConstantDiv(lhs, rhs, lhsRef, ctx, false);
-            case "%" -> emitConstantDiv(lhs, rhs, lhsRef, ctx, true);
             case "&" ->
                 emitLine("        ANDWF   " + lhsRef + ", W, A   ; W = lhs & rhs");
             case "|" ->
                 emitLine("        IORWF   " + lhsRef + ", W, A   ; W = lhs | rhs");
             case "^" ->
                 emitLine("        XORWF   " + lhsRef + ", W, A   ; W = lhs ^ rhs");
-            case "==" -> emitCompare(lhsRef, "==");
-            case "!=" -> emitCompare(lhsRef, "!=");
-            case "<"  -> emitCompare(lhsRef, "<");
-            case "<=" -> emitCompare(lhsRef, "<=");
-            case ">"  -> emitCompare(lhsRef, ">");
-            case ">=" -> emitCompare(lhsRef, ">=");
+            case "==", "!=", "<", "<=", ">", ">=" -> emitCompare(lhsRef, op);
             default -> throw new CompileException(ctx, "unsupported binary op '" + op + "'");
         }
-        popW();
     }
 
     /**
-     * Emit assembly for a comparison, given that {@code WREG} holds the rhs and
-     * {@code EVAL_STACK[sp-1]} (label {@code lhsRef}) holds the lhs. The
-     * result is left in {@code WREG} as 0 (false) or 1 (true).
-     *
-     * <p>PIC18 mnemonics:
-     * <ul>
-     *   <li>{@code CPFSEQ f}: skip next instruction if W == f</li>
-     *   <li>{@code CPFSGT f}: skip next instruction if W &gt; f (unsigned)</li>
-     *   <li>{@code CPFSLT f}: skip next instruction if W &lt; f (unsigned)</li>
-     * </ul>
-     * Because we want {@code lhs OP rhs}, and {@code f = lhs}, {@code W = rhs},
-     * we translate:
-     * <pre>
-     *   lhs == rhs  =&gt;  W == f         =&gt; CPFSEQ f
-     *   lhs &gt; rhs   =&gt;  f &gt; W   =&gt; W &lt; f         =&gt; CPFSLT f
-     *   lhs &lt; rhs   =&gt;  f &lt; W   =&gt; W &gt; f         =&gt; CPFSGT f
-     * </pre>
+     * Emit a comparison whose LHS is at {@code lhsRef} and RHS is already in
+     * {@code WREG}. Result is left in {@code WREG} as 0/1. See the original
+     * MiniC version of this method for the full mnemonic-mapping rationale.
      */
     private void emitCompare(String lhsRef, String op) {
-        // CPFS<X> f, A skips the next instruction when its predicate is true.
-        // We pick a mnemonic so that "predicate true" means "the source-level
-        // comparison evaluates to true" -- but for !=, <=, >= the instruction's
-        // predicate is the inverse, so we set `invertResult` and swap the 0/1
-        // values placed into W.
         String mnem;
         boolean invertResult = false;
         switch (op) {
             case "==" -> mnem = "CPFSEQ";
             case "!=" -> { mnem = "CPFSEQ"; invertResult = true; }
-            // f > W  <=>  W < f, so CPFSLT skips when (lhs > rhs)
             case ">"  -> mnem = "CPFSLT";
             case "<=" -> { mnem = "CPFSLT"; invertResult = true; }
-            // f < W  <=>  W > f, so CPFSGT skips when (lhs < rhs)
             case "<"  -> mnem = "CPFSGT";
             case ">=" -> { mnem = "CPFSGT"; invertResult = true; }
             default -> throw new CompileException("internal: bad compare op " + op);
         }
         String falseLbl = newLabel("CMP_F");
         String endLbl   = newLabel("CMP_E");
-        String onSkip   = invertResult ? "0x00" : "0x01";   // when predicate true
-        String onFall   = invertResult ? "0x01" : "0x00";   // when predicate false
+        String onSkip   = invertResult ? "0x00" : "0x01";
+        String onFall   = invertResult ? "0x01" : "0x00";
 
         emitLine("        " + mnem + "  " + lhsRef + ", A   ; skip next if " + op + " true");
         emitLine("        BRA     " + falseLbl);
@@ -762,117 +1344,19 @@ public class Pic18CodeGenerator extends MiniCBaseVisitor<Void> {
         emitLine(endLbl + ":");
     }
 
-    /** Emit constant division/modulus by a power-of-two integer literal. */
-    private void emitConstantDiv(MiniCParser.ExpressionContext lhs,
-                                 MiniCParser.ExpressionContext rhs,
-                                 String lhsRef,
-                                 ParserRuleContext ctx,
-                                 boolean isMod) {
-        Integer rhsConst = evalConstantExpression(rhs);
-        if (rhsConst == null) {
-            throw new CompileException(ctx,
-                    (isMod ? "%" : "/") + " requires a constant power-of-two right operand "
-                            + "(division runtime not yet implemented)");
-        }
-        int rv = rhsConst & 0xFF;
-        if (rv == 0) {
-            throw new CompileException(ctx, "division by zero");
-        }
-        int log = Integer.numberOfTrailingZeros(rv);
-        if ((rv & (rv - 1)) != 0) {
-            throw new CompileException(ctx,
-                    (isMod ? "%" : "/") + " by " + rv + " not supported (only powers of two for now)");
-        }
-        // We currently have W = rhs (which we no longer need) and lhs at lhsRef.
-        // Move lhs into W and then do shifts (for /) or mask (for %).
-        emitLine("        MOVF    " + lhsRef + ", W, A      ; reload lhs");
-        if (isMod) {
-            int mask = rv - 1;
-            emitLine("        ANDLW   " + hex8(mask) + "       ; W = lhs % " + rv);
-        } else {
-            // Right-shift `log` times. Use RRNCF (rotate right no carry) — for
-            // unsigned it's effectively a logical shift right with W input.
-            // RRNCF takes f, but we can use a temp slot R0.
-            emitLine("        MOVWF   R0, A");
-            for (int i = 0; i < log; i++) {
-                emitLine("        BCF     STATUS, C, A   ; clear carry");
-                emitLine("        RRCF    R0, F, A");
-            }
-            emitLine("        MOVF    R0, W, A         ; W = lhs / " + rv);
-        }
-    }
-
-    private void emitShift(MiniCParser.ShiftExprContext ctx) {
-        String op = ctx.op.getText();
-        Integer rhsConst = evalConstantExpression(ctx.expression(1));
-        if (rhsConst == null) {
-            throw new CompileException(ctx,
-                    "shift count must be a constant integer (variable shifts not yet supported)");
-        }
-        int n = rhsConst & 0xFF;
-        emitExpression(ctx.expression(0));
-        // W has lhs.
-        if (n == 0) {
-            return;
-        }
-        emitLine("        MOVWF   R0, A");
-        for (int i = 0; i < n; i++) {
-            emitLine("        BCF     STATUS, C, A");
-            if (op.equals("<<")) {
-                emitLine("        RLCF    R0, F, A");
-            } else {
-                emitLine("        RRCF    R0, F, A");
-            }
-        }
-        emitLine("        MOVF    R0, W, A");
-    }
-
-    private void emitLogicalAnd(MiniCParser.LogAndExprContext ctx) {
-        String falseLbl = newLabel("LAND_F");
-        String endLbl   = newLabel("LAND_E");
-        emitExpression(ctx.expression(0));
-        emitLine("        IORLW   0");
-        emitLine("        BZ      " + falseLbl);
-        emitExpression(ctx.expression(1));
-        emitLine("        IORLW   0");
-        emitLine("        BZ      " + falseLbl);
-        emitLine("        MOVLW   0x01");
-        emitLine("        BRA     " + endLbl);
-        emitLine(falseLbl + ":");
-        emitLine("        MOVLW   0x00");
-        emitLine(endLbl + ":");
-    }
-
-    private void emitLogicalOr(MiniCParser.LogOrExprContext ctx) {
-        String trueLbl = newLabel("LOR_T");
-        String endLbl  = newLabel("LOR_E");
-        emitExpression(ctx.expression(0));
-        emitLine("        IORLW   0");
-        emitLine("        BNZ     " + trueLbl);
-        emitExpression(ctx.expression(1));
-        emitLine("        IORLW   0");
-        emitLine("        BNZ     " + trueLbl);
-        emitLine("        MOVLW   0x00");
-        emitLine("        BRA     " + endLbl);
-        emitLine(trueLbl + ":");
-        emitLine("        MOVLW   0x01");
-        emitLine(endLbl + ":");
-    }
-
     // -------------------------------------------------------------------------
     // Function calls (incl. built-ins out / in / delay)
     // -------------------------------------------------------------------------
 
-    private void emitCall(MiniCParser.CallExprContext ctx) {
-        String fname = ctx.ID().getText();
-        List<MiniCParser.ExpressionContext> args = ctx.argList() != null
-                ? ctx.argList().expression()
-                : List.of();
+    private void emitCall(String fname, ArgumentExpressionListContext args, ParserRuleContext ctx) {
+        List<AssignmentExpressionContext> argList = (args == null)
+                ? List.of()
+                : args.assignmentExpression();
 
         switch (fname) {
-            case "out"   -> { emitBuiltinOut(ctx, args); return; }
-            case "in"    -> { emitBuiltinIn(ctx, args); return; }
-            case "delay" -> { emitBuiltinDelay(ctx, args); return; }
+            case "out"   -> { emitBuiltinOut(ctx, argList); return; }
+            case "in"    -> { emitBuiltinIn(ctx, argList); return; }
+            case "delay" -> { emitBuiltinDelay(ctx, argList); return; }
             default -> { /* fall through */ }
         }
 
@@ -880,56 +1364,48 @@ public class Pic18CodeGenerator extends MiniCBaseVisitor<Void> {
         if (sig == null) {
             throw new CompileException(ctx, "call to unknown function '" + fname + "'");
         }
-        if (args.size() != sig.paramNames.size()) {
+        if (argList.size() != sig.paramNames.size()) {
             throw new CompileException(ctx, "call to '" + fname + "': expected "
-                    + sig.paramNames.size() + " args, got " + args.size());
+                    + sig.paramNames.size() + " args, got " + argList.size());
         }
 
         emitComment("call " + fname);
-
-        // Evaluate args left-to-right, push to EVAL_STACK so subsequent arg
-        // evaluations don't clobber earlier ones; then move them into ARG slots
-        // just before the CALL.
         int argBase = sp;
-        for (MiniCParser.ExpressionContext a : args) {
-            emitExpression(a);
+        for (AssignmentExpressionContext a : argList) {
+            emitAssignmentExpression(a);
             pushW();
         }
-        for (int i = args.size() - 1; i >= 0; i--) {
+        for (int i = argList.size() - 1; i >= 0; i--) {
             emitLine("        MOVF    EVAL_STACK+" + (argBase + i) + ", W, A");
             emitLine("        MOVWF   ARG" + i + ", A");
         }
-        // Pop the arg slots.
-        for (int i = 0; i < args.size(); i++) {
+        for (int i = 0; i < argList.size(); i++) {
             popW();
         }
-
         emitLine("        CALL    " + sig.label + ", 0   ; FAST=0; uses HW return stack");
         emitLine("        MOVF    RETVAL, W, A");
     }
 
-    private void emitBuiltinOut(MiniCParser.CallExprContext ctx,
-                                List<MiniCParser.ExpressionContext> args) {
+    private void emitBuiltinOut(ParserRuleContext ctx, List<AssignmentExpressionContext> args) {
         if (args.size() != 2) {
             throw new CompileException(ctx, "out(port, value) takes 2 args");
         }
-        Integer portConst = evalConstantExpression(args.get(0));
+        Integer portConst = evalConstantAssign(args.get(0));
         if (portConst == null) {
             throw new CompileException(ctx,
                     "out(): port argument must be a constant integer 0..4 (PORTA..PORTE)");
         }
         String latReg = portToLatRegister(portConst, ctx);
         emitComment("out(" + portConst + " /* " + latReg + " */, expr)");
-        emitExpression(args.get(1));
+        emitAssignmentExpression(args.get(1));
         emitLine("        MOVWF   " + latReg + ", A   ; drive port");
     }
 
-    private void emitBuiltinIn(MiniCParser.CallExprContext ctx,
-                               List<MiniCParser.ExpressionContext> args) {
+    private void emitBuiltinIn(ParserRuleContext ctx, List<AssignmentExpressionContext> args) {
         if (args.size() != 1) {
             throw new CompileException(ctx, "in(port) takes 1 arg");
         }
-        Integer portConst = evalConstantExpression(args.get(0));
+        Integer portConst = evalConstantAssign(args.get(0));
         if (portConst == null) {
             throw new CompileException(ctx,
                     "in(): port argument must be a constant integer 0..4 (PORTA..PORTE)");
@@ -939,13 +1415,12 @@ public class Pic18CodeGenerator extends MiniCBaseVisitor<Void> {
         emitLine("        MOVF    " + portReg + ", W, A   ; read port");
     }
 
-    private void emitBuiltinDelay(MiniCParser.CallExprContext ctx,
-                                  List<MiniCParser.ExpressionContext> args) {
+    private void emitBuiltinDelay(ParserRuleContext ctx, List<AssignmentExpressionContext> args) {
         if (args.size() != 1) {
             throw new CompileException(ctx, "delay(n) takes 1 arg");
         }
         emitComment("delay(n)");
-        emitExpression(args.get(0));
+        emitAssignmentExpression(args.get(0));
         emitLine("        MOVWF   ARG0, A");
         emitLine("        CALL    F_delay, 0");
         runtimeNeeded.add("delay");
@@ -1001,8 +1476,259 @@ public class Pic18CodeGenerator extends MiniCBaseVisitor<Void> {
     }
 
     // -------------------------------------------------------------------------
-    // Helpers: expression stack tracking, labels, formatting
+    // Constant folding (used for global initializers, shift counts, /, %, ports)
     // -------------------------------------------------------------------------
+
+    private Integer evalConstantAssign(AssignmentExpressionContext ctx) {
+        if (ctx.assignementOperator != null) {
+            return null; // assignments aren't constant
+        }
+        if (ctx.DigitSequence() != null) {
+            return parseInt(ctx.DigitSequence().getText(), 10);
+        }
+        return evalConstantConditional(ctx.conditionalExpression());
+    }
+
+    private Integer evalConstantConditional(ConditionalExpressionContext ctx) {
+        if (ctx.expression() != null) {
+            return null; // ternary not folded
+        }
+        return evalConstantLOr(ctx.logicalOrExpression());
+    }
+
+    private Integer evalConstantLOr(LogicalOrExpressionContext ctx) {
+        if (ctx.logicalAndExpression().size() > 1) {
+            return null;
+        }
+        return evalConstantLAnd(ctx.logicalAndExpression(0));
+    }
+
+    private Integer evalConstantLAnd(LogicalAndExpressionContext ctx) {
+        if (ctx.inclusiveOrExpression().size() > 1) {
+            return null;
+        }
+        return evalConstantInclusiveOr(ctx.inclusiveOrExpression(0));
+    }
+
+    private Integer evalConstantInclusiveOr(InclusiveOrExpressionContext ctx) {
+        return foldChain(ctx.exclusiveOrExpression(), extractOps(ctx, "|"),
+                this::evalConstantExclusiveOr);
+    }
+
+    private Integer evalConstantExclusiveOr(ExclusiveOrExpressionContext ctx) {
+        return foldChain(ctx.andExpression(), extractOps(ctx, "^"),
+                this::evalConstantAnd);
+    }
+
+    private Integer evalConstantAnd(AndExpressionContext ctx) {
+        return foldChain(ctx.equalityExpression(), extractOps(ctx, "&"),
+                this::evalConstantEquality);
+    }
+
+    private Integer evalConstantEquality(EqualityExpressionContext ctx) {
+        if (ctx.relationalExpression().size() > 1) {
+            return null;
+        }
+        return evalConstantRelational(ctx.relationalExpression(0));
+    }
+
+    private Integer evalConstantRelational(RelationalExpressionContext ctx) {
+        if (ctx.shiftExpression().size() > 1) {
+            return null;
+        }
+        return evalConstantShift(ctx.shiftExpression(0));
+    }
+
+    private Integer evalConstantShift(ShiftExpressionContext ctx) {
+        return foldChain(ctx.additiveExpression(), extractOps(ctx, "<<", ">>"),
+                this::evalConstantAdditive);
+    }
+
+    private Integer evalConstantAdditive(AdditiveExpressionContext ctx) {
+        return foldChain(ctx.multiplicativeExpression(), extractOps(ctx, "+", "-"),
+                this::evalConstantMultiplicative);
+    }
+
+    private Integer evalConstantMultiplicative(MultiplicativeExpressionContext ctx) {
+        return foldChain(ctx.castExpression(), extractOps(ctx, "*", "/", "%"),
+                this::evalConstantCast);
+    }
+
+    private Integer evalConstantCast(CastExpressionContext ctx) {
+        if (ctx.typeName() != null) {
+            return null;
+        }
+        if (ctx.DigitSequence() != null) {
+            return parseInt(ctx.DigitSequence().getText(), 10);
+        }
+        return evalConstantUnary(ctx.unaryExpression());
+    }
+
+    private Integer evalConstantUnary(UnaryExpressionContext ctx) {
+        if (ctx.postfixExpression() != null) {
+            return evalConstantPostfix(ctx.postfixExpression());
+        }
+        if (ctx.unaryOperator != null && ctx.castExpression() != null) {
+            Integer v = evalConstantCast(ctx.castExpression());
+            if (v == null) return null;
+            return switch (ctx.unaryOperator.getText()) {
+                case "+" -> v;
+                case "-" -> -v;
+                case "~" -> ~v;
+                case "!" -> v == 0 ? 1 : 0;
+                default  -> null;
+            };
+        }
+        return null;
+    }
+
+    private Integer evalConstantPostfix(PostfixExpressionContext ctx) {
+        if (ctx.getChildCount() != 1) {
+            return null;
+        }
+        if (ctx.primaryExpression() == null) {
+            return null;
+        }
+        return evalConstantPrimary(ctx.primaryExpression());
+    }
+
+    private Integer evalConstantPrimary(PrimaryExpressionContext ctx) {
+        if (ctx.constant() != null) {
+            return evalConstantConst(ctx.constant());
+        }
+        if (ctx.expression() != null) {
+            ExpressionContext e = ctx.expression();
+            if (e.assignmentExpression().size() != 1) {
+                return null;
+            }
+            return evalConstantAssign(e.assignmentExpression(0));
+        }
+        return null;
+    }
+
+    private Integer evalConstantConst(ConstantContext ctx) {
+        if (ctx.IntegerConstant() != null) {
+            return parseIntegerLiteral(ctx.IntegerConstant().getText(), ctx);
+        }
+        if (ctx.CharacterConstant() != null) {
+            return parseCharLiteral(ctx.CharacterConstant().getText(), ctx);
+        }
+        if (ctx.predefinedConstant() != null) {
+            String t = ctx.predefinedConstant().getText();
+            if ("true".equals(t)) return 1;
+            if ("false".equals(t)) return 0;
+        }
+        return null;
+    }
+
+    private <T extends ParserRuleContext> Integer foldChain(List<T> opers, List<String> ops,
+                                                            Function<T, Integer> fold) {
+        Integer acc = fold.apply(opers.get(0));
+        if (acc == null) {
+            return null;
+        }
+        for (int i = 1; i < opers.size(); i++) {
+            Integer rhs = fold.apply(opers.get(i));
+            if (rhs == null) {
+                return null;
+            }
+            switch (ops.get(i - 1)) {
+                case "+"  -> acc = acc + rhs;
+                case "-"  -> acc = acc - rhs;
+                case "*"  -> acc = acc * rhs;
+                case "/"  -> { if (rhs == 0) return null; acc = acc / rhs; }
+                case "%"  -> { if (rhs == 0) return null; acc = acc % rhs; }
+                case "<<" -> acc = acc << rhs;
+                case ">>" -> acc = acc >> rhs;
+                case "&"  -> acc = acc & rhs;
+                case "|"  -> acc = acc | rhs;
+                case "^"  -> acc = acc ^ rhs;
+                default -> { return null; }
+            }
+        }
+        return acc;
+    }
+
+    // -------------------------------------------------------------------------
+    // Helpers: identifier extraction, expression-stack tracking, formatting
+    // -------------------------------------------------------------------------
+
+    /**
+     * Return the bare identifier name if {@code u} is just a single
+     * identifier with no operators or suffixes (the only kind of lvalue this
+     * compiler accepts). Returns {@code null} otherwise.
+     */
+    private String extractBareIdentifier(UnaryExpressionContext u) {
+        if (u == null || u.postfixExpression() == null) {
+            return null;
+        }
+        return extractIdFromPostfix(u.postfixExpression());
+    }
+
+    private String extractIdFromPostfix(PostfixExpressionContext pe) {
+        if (pe.primaryExpression() == null || pe.getChildCount() != 1) {
+            return null;
+        }
+        return extractIdFromPrimary(pe.primaryExpression());
+    }
+
+    private String extractIdFromPrimary(PrimaryExpressionContext pr) {
+        if (pr.Identifier() != null && pr.getChildCount() == 1) {
+            return pr.Identifier().getText();
+        }
+        // Allow `(x)` to count as a bare identifier.
+        if (pr.expression() != null) {
+            ExpressionContext e = pr.expression();
+            if (e.assignmentExpression().size() == 1) {
+                AssignmentExpressionContext ae = e.assignmentExpression(0);
+                if (ae.assignementOperator == null && ae.conditionalExpression() != null) {
+                    ConditionalExpressionContext ce = ae.conditionalExpression();
+                    if (ce.expression() == null) {
+                        // Walk down the chain looking for a single bare identifier.
+                        return idFromLOr(ce.logicalOrExpression());
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private String idFromLOr(LogicalOrExpressionContext c) {
+        if (c.logicalAndExpression().size() != 1) return null;
+        LogicalAndExpressionContext la = c.logicalAndExpression(0);
+        if (la.inclusiveOrExpression().size() != 1) return null;
+        InclusiveOrExpressionContext io = la.inclusiveOrExpression(0);
+        if (io.exclusiveOrExpression().size() != 1) return null;
+        ExclusiveOrExpressionContext xo = io.exclusiveOrExpression(0);
+        if (xo.andExpression().size() != 1) return null;
+        AndExpressionContext an = xo.andExpression(0);
+        if (an.equalityExpression().size() != 1) return null;
+        EqualityExpressionContext eq = an.equalityExpression(0);
+        if (eq.relationalExpression().size() != 1) return null;
+        RelationalExpressionContext rl = eq.relationalExpression(0);
+        if (rl.shiftExpression().size() != 1) return null;
+        ShiftExpressionContext sh = rl.shiftExpression(0);
+        if (sh.additiveExpression().size() != 1) return null;
+        AdditiveExpressionContext ad = sh.additiveExpression(0);
+        if (ad.multiplicativeExpression().size() != 1) return null;
+        MultiplicativeExpressionContext mu = ad.multiplicativeExpression(0);
+        if (mu.castExpression().size() != 1) return null;
+        CastExpressionContext ca = mu.castExpression(0);
+        if (ca.typeName() != null || ca.DigitSequence() != null) return null;
+        return extractBareIdentifier(ca.unaryExpression());
+    }
+
+    private List<String> extractOps(ParserRuleContext ctx, String... allowed) {
+        Set<String> ok = new LinkedHashSet<>(Arrays.asList(allowed));
+        List<String> result = new ArrayList<>();
+        for (int i = 0; i < ctx.getChildCount(); i++) {
+            ParseTree c = ctx.getChild(i);
+            if (c instanceof TerminalNode tn && ok.contains(tn.getText())) {
+                result.add(tn.getText());
+            }
+        }
+        return result;
+    }
 
     private void pushW() {
         emitLine("        MOVWF   EVAL_STACK+" + sp + ", A   ; push (sp=" + sp + ")");
@@ -1041,96 +1767,55 @@ public class Pic18CodeGenerator extends MiniCBaseVisitor<Void> {
         throw new CompileException(ctx, "undefined identifier '" + name + "'");
     }
 
-    private static String typeName(MiniCParser.TypeContext ctx) {
-        // Re-stringify type. The grammar only allows `unsigned? (int|char) | void`.
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < ctx.getChildCount(); i++) {
-            if (i > 0) sb.append(' ');
-            sb.append(ctx.getChild(i).getText());
-        }
-        return sb.toString().contains("void") ? "void" : "int";
-    }
-
-    /**
-     * Try to fold an expression to a compile-time constant (8-bit). Returns
-     * {@code null} if the expression isn't a pure constant integer.
-     */
-    private Integer evalConstantExpression(MiniCParser.ExpressionContext ctx) {
-        if (ctx instanceof MiniCParser.ParenExprContext p) {
-            return evalConstantExpression(p.expression());
-        }
-        if (ctx instanceof MiniCParser.IntLitContext l) {
-            return parseInt(l.INT().getText(), 10);
-        }
-        if (ctx instanceof MiniCParser.HexLitContext l) {
-            return parseInt(l.HEX().getText().substring(2), 16);
-        }
-        if (ctx instanceof MiniCParser.CharLitContext l) {
-            return parseChar(l.CHAR().getText(), l);
-        }
-        if (ctx instanceof MiniCParser.UnaryExprContext u) {
-            Integer v = evalConstantExpression(u.expression());
-            if (v == null) return null;
-            return switch (u.op.getText()) {
-                case "-" -> -v;
-                case "~" -> ~v;
-                case "!" -> v == 0 ? 1 : 0;
-                default  -> null;
-            };
-        }
-        if (ctx instanceof MiniCParser.AddExprContext a) {
-            return binConst(a.expression(0), a.expression(1), a.op.getText());
-        }
-        if (ctx instanceof MiniCParser.MulExprContext m) {
-            return binConst(m.expression(0), m.expression(1), m.op.getText());
-        }
-        if (ctx instanceof MiniCParser.ShiftExprContext s) {
-            return binConst(s.expression(0), s.expression(1), s.op.getText());
-        }
-        if (ctx instanceof MiniCParser.BitAndExprContext b) {
-            return binConst(b.expression(0), b.expression(1), "&");
-        }
-        if (ctx instanceof MiniCParser.BitOrExprContext b) {
-            return binConst(b.expression(0), b.expression(1), "|");
-        }
-        if (ctx instanceof MiniCParser.BitXorExprContext b) {
-            return binConst(b.expression(0), b.expression(1), "^");
-        }
-        return null;
-    }
-
-    private Integer binConst(MiniCParser.ExpressionContext a,
-                             MiniCParser.ExpressionContext b,
-                             String op) {
-        Integer x = evalConstantExpression(a);
-        Integer y = evalConstantExpression(b);
-        if (x == null || y == null) return null;
-        return switch (op) {
-            case "+" -> x + y;
-            case "-" -> x - y;
-            case "*" -> x * y;
-            case "/" -> y == 0 ? null : x / y;
-            case "%" -> y == 0 ? null : x % y;
-            case "<<" -> x << y;
-            case ">>" -> x >> y;
-            case "&" -> x & y;
-            case "|" -> x | y;
-            case "^" -> x ^ y;
-            default  -> null;
-        };
-    }
-
     private static int parseInt(String s, int radix) {
         return Integer.parseInt(s, radix);
     }
 
-    private static int parseChar(String literal, ParserRuleContext ctx) {
-        // strip surrounding quotes; handle a couple of basic escapes.
-        if (literal.length() < 3 || literal.charAt(0) != '\''
-                || literal.charAt(literal.length() - 1) != '\'') {
+    /** Parse a C integer literal (supports decimal, hex, octal, binary, with U/L suffixes). */
+    private static int parseIntegerLiteral(String raw, ParserRuleContext ctx) {
+        String s = raw;
+        // Strip integer suffixes (u, U, l, L, ll, LL).
+        while (!s.isEmpty()) {
+            char c = s.charAt(s.length() - 1);
+            if (c == 'u' || c == 'U' || c == 'l' || c == 'L') {
+                s = s.substring(0, s.length() - 1);
+            } else {
+                break;
+            }
+        }
+        if (s.isEmpty()) {
+            throw new CompileException(ctx, "malformed integer constant: " + raw);
+        }
+        try {
+            if (s.length() > 1 && s.charAt(0) == '0'
+                    && (s.charAt(1) == 'x' || s.charAt(1) == 'X')) {
+                return Integer.parseInt(s.substring(2), 16);
+            }
+            if (s.length() > 1 && s.charAt(0) == '0'
+                    && (s.charAt(1) == 'b' || s.charAt(1) == 'B')) {
+                return Integer.parseInt(s.substring(2), 2);
+            }
+            if (s.length() > 1 && s.charAt(0) == '0') {
+                return Integer.parseInt(s.substring(1), 8);
+            }
+            return Integer.parseInt(s, 10);
+        } catch (NumberFormatException e) {
+            throw new CompileException(ctx, "malformed integer constant: " + raw);
+        }
+    }
+
+    private static int parseCharLiteral(String literal, ParserRuleContext ctx) {
+        String s = literal;
+        // Strip optional encoding prefix (L', u', U').
+        if (s.length() >= 3 && (s.charAt(0) == 'L' || s.charAt(0) == 'u' || s.charAt(0) == 'U')
+                && s.charAt(1) == '\'') {
+            s = s.substring(1);
+        }
+        if (s.length() < 3 || s.charAt(0) != '\''
+                || s.charAt(s.length() - 1) != '\'') {
             throw new CompileException(ctx, "malformed char literal: " + literal);
         }
-        String body = literal.substring(1, literal.length() - 1);
+        String body = s.substring(1, s.length() - 1);
         if (body.length() == 1) {
             return body.charAt(0) & 0xFF;
         }
@@ -1143,6 +1828,11 @@ public class Pic18CodeGenerator extends MiniCBaseVisitor<Void> {
                 case '\\' -> '\\';
                 case '\'' -> '\'';
                 case '"'  -> '"';
+                case 'a'  -> 0x07;
+                case 'b'  -> '\b';
+                case 'f'  -> '\f';
+                case 'v'  -> 0x0B;
+                case '?'  -> '?';
                 default -> throw new CompileException(ctx, "unknown escape: " + body);
             };
         }
@@ -1168,4 +1858,8 @@ public class Pic18CodeGenerator extends MiniCBaseVisitor<Void> {
     private void emitComment(String s) {
         code.append("        ; ").append(s).append('\n');
     }
+
+    /** Reference to the {@link CParser} class for unused-import suppression. */
+    @SuppressWarnings("unused")
+    private static final Class<?> KEEP_CPARSER_REF = CParser.class;
 }

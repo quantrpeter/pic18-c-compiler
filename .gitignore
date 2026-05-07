@@ -36,6 +36,9 @@ bin/
 # IDE - VS Code
 .vscode/
 
+# ANTLR plugin cache (created next to .g4 files by the IDE plugin / antlr4-tool)
+.antlr/
+
 # macOS
 .DS_Store
 

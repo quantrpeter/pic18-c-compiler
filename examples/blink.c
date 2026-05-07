@@ -22,11 +22,13 @@ int main(void) {
         out(1, 0x00);          // LATB <- 0x00 (RB0 low)
         delay(200);
     }
-    for (int a=0;a<10;a++){
+    int b=0;
+    for (int a=0;a<10+b/2;a++){
         out(1, 0x01);          // LATB <- 0x01 (RB0 high)
         delay(200);
         out(1, 0x00);          // LATB <- 0x00 (RB0 low)
         delay(200);
+        b++;
     }
     return 0;
 }
