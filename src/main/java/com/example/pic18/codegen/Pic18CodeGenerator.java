@@ -413,7 +413,7 @@ public class Pic18CodeGenerator {
     }
 
     private List<String> parseParamList(ParameterTypeListContext ptl) {
-        List<String> params = new ArrayList<>();
+        List<String> params = new ArrayList();
         // Reject varargs.
         for (int i = 0; i < ptl.getChildCount(); i++) {
             ParseTree c = ptl.getChild(i);
@@ -1720,7 +1720,7 @@ public class Pic18CodeGenerator {
 
     private List<String> extractOps(ParserRuleContext ctx, String... allowed) {
         Set<String> ok = new LinkedHashSet<>(Arrays.asList(allowed));
-        List<String> result = new ArrayList<>();
+        List<String> result = new ArrayList();
         for (int i = 0; i < ctx.getChildCount(); i++) {
             ParseTree c = ctx.getChild(i);
             if (c instanceof TerminalNode tn && ok.contains(tn.getText())) {
